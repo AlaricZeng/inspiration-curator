@@ -1,0 +1,36 @@
+epics:
+  - id: 1
+    name: "Foundation & Authentication"
+    status: not-started
+    stories:
+      - { id: "1.1", name: "Project Bootstrap", status: not-started }
+      - { id: "1.2", name: "Database Models", status: not-started }
+      - { id: "1.3", name: "Playwright Session Manager", status: not-started }
+      - { id: "1.4", name: "First-Run Auth Wizard", status: not-started }
+
+  - id: 2
+    name: "Daily Scraper"
+    status: not-started
+    stories:
+      - { id: "2.1", name: "APScheduler Setup", status: not-started }
+      - { id: "2.2", name: "Instagram Scraper", status: not-started }
+      - { id: "2.3", name: "Xiaohongshu Scraper", status: not-started }
+      - { id: "2.4", name: "Scrape Orchestrator", status: not-started }
+
+  - id: 3
+    name: "Curation UI"
+    status: not-started
+    stories:
+      - { id: "3.1", name: "Today Page — Keyword Input", status: not-started }
+      - { id: "3.2", name: "Curation Flow", status: not-started }
+      - { id: "3.3", name: "Save Liked Shots", status: not-started }
+      - { id: "3.4", name: "Gallery Page", status: not-started }
+
+  - id: 4
+    name: "Taste Engine"
+    status: not-started
+    stories:
+      - { id: "4.1", name: "AI Vibe Analysis", status: not-started }
+      - { id: "4.2", name: "Taste Profile Page", status: not-started }
+      - { id: "4.3", name: "First-Run Seed", status: not-started }
+      - { id: "4.4", name: "Vibe Mode Search Integration", status: not-started }

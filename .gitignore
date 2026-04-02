@@ -1,0 +1,12 @@
+.env
+sessions/
+staging/
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+node_modules/
+frontend/dist/
+*.db
+*.sqlite

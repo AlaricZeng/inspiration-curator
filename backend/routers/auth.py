@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Literal, Optional
+from typing import Literal, Optional  # noqa: F401 — Optional needed for Pydantic on py39
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel

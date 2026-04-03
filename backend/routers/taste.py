@@ -11,6 +11,7 @@ DELETE /api/creators/{id}       — remove a creator
 from __future__ import annotations
 
 import datetime
+from typing import Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -50,9 +51,9 @@ class TasteResponse(BaseModel):
 
 class KeywordPatchBody(BaseModel):
     keyword: str
-    pinned: bool | None = None
-    blocked: bool | None = None
-    add: bool | None = None
+    pinned: Optional[bool] = None
+    blocked: Optional[bool] = None
+    add: Optional[bool] = None
 
 
 class SeedNeededResponse(BaseModel):

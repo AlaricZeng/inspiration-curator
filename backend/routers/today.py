@@ -11,6 +11,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 from pathlib import Path
+from typing import Optional
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 from pydantic import BaseModel
@@ -41,14 +42,14 @@ class PostOut(BaseModel):
     platform: str
     creator: str
     engagement: int
-    screenshot_url: str | None
+    screenshot_url: Optional[str]
     status: str
 
 
 class TodayResponse(BaseModel):
     date: str
     status: str
-    keyword: str | None
+    keyword: Optional[str]
     pending_count: int
     posts: list[PostOut]
 
@@ -63,7 +64,7 @@ class KeywordResponse(BaseModel):
 
 class ActionResponse(BaseModel):
     status: str
-    saved_path: str | None = None
+    saved_path: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
+from typing import Optional
 
 from fastapi import APIRouter
 from pydantic import BaseModel
@@ -23,7 +24,7 @@ class GalleryPostOut(BaseModel):
     platform: str
     creator: str
     engagement: int
-    screenshot_url: str | None
+    screenshot_url: Optional[str]
 
 
 class GalleryDay(BaseModel):

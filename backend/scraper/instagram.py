@@ -38,7 +38,7 @@ _IG_HEADERS = {
 }
 
 # Max pages to paginate through for hashtag "top" results (50 posts per page)
-_HASHTAG_MAX_PAGES = 10
+_HASHTAG_MAX_PAGES = 5
 
 
 # ---------------------------------------------------------------------------

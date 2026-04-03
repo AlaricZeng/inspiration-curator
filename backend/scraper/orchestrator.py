@@ -204,7 +204,9 @@ def _persist_results(
         for platform, candidate in results:
             screenshot_path: str | None = None
             if candidate.screenshot_data:
-                filename = f"{platform.value}_{uuid.uuid4().hex[:8]}.png"
+                # Detect actual format: JPEG starts with FF D8, PNG with 89 50 4E 47
+                ext = "jpg" if candidate.screenshot_data[:2] == b"\xff\xd8" else "png"
+                filename = f"{platform.value}_{uuid.uuid4().hex[:8]}.{ext}"
                 screenshot_file = staging_dir / filename
                 try:
                     screenshot_file.write_bytes(candidate.screenshot_data)

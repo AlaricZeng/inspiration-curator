@@ -43,8 +43,13 @@ async def scrape_xiaohongshu(
     keyword: str | None,
     creator_handles: list[str],
     max_results: int = 10,
+    skip_urls: set[str] | None = None,
 ) -> list[PostCandidate]:
     """Scrape Xiaohongshu and return up to *max_results* candidates ranked by engagement.
+
+    Args:
+        skip_urls: Set of source URLs already seen in the DB. The scraper will
+                   scroll deeper to find fresh posts when candidates are exhausted.
 
     Raises:
         SessionExpiredError: login wall detected during scraping.
@@ -59,13 +64,15 @@ async def scrape_xiaohongshu(
             page.set_default_timeout(20_000)
 
             if keyword:
-                found = await _scrape_keyword(page, keyword, max_results)
+                found = await _scrape_keyword(page, keyword, max_results, skip_urls=skip_urls)
                 candidates.extend(found)
 
             for handle in creator_handles:
                 if len(candidates) >= max_results:
                     break
-                found = await _scrape_creator(page, handle, max_results - len(candidates))
+                found = await _scrape_creator(
+                    page, handle, max_results - len(candidates), skip_urls=skip_urls
+                )
                 candidates.extend(found)
 
         finally:
@@ -105,7 +112,7 @@ async def _assert_not_login_wall(page: Page) -> None:
 
 
 async def _scrape_keyword(
-    page: Page, keyword: str, limit: int
+    page: Page, keyword: str, limit: int, *, skip_urls: set[str] | None = None
 ) -> list[PostCandidate]:
     # type=51 filters to note/post results
     url = f"{_BASE}/search_result?keyword={quote(keyword)}&type=51"
@@ -118,10 +125,25 @@ async def _scrape_keyword(
         return []
 
     await _assert_not_login_wall(page)
-    await _scroll_to_load_cards(page)
 
-    cards = await _collect_note_cards(page, limit * 3)
-    return await _harvest_notes(page, cards, limit, from_creator=False)
+    # Scroll progressively, retrying until we collect enough fresh candidates
+    # or hit a maximum scroll-round cap.
+    _MAX_SCROLL_ROUNDS = 8
+    for scroll_round in range(1, _MAX_SCROLL_ROUNDS + 1):
+        await _scroll_to_load_cards(page, steps=scroll_round * 4)
+        cards = await _collect_note_cards(page, limit * (scroll_round + 2))
+        candidates = await _harvest_notes(page, cards, limit, from_creator=False, skip_urls=skip_urls)
+        if len(candidates) >= limit:
+            logger.debug("XHS keyword: filled %d slots after %d scroll round(s).", limit, scroll_round)
+            return candidates
+        logger.debug(
+            "XHS keyword scroll round %d: %d/%d fresh candidates; scrolling deeper.",
+            scroll_round, len(candidates), limit,
+        )
+
+    # Best-effort: return whatever we managed to find
+    cards = await _collect_note_cards(page, limit * 10)
+    return await _harvest_notes(page, cards, limit, from_creator=False, skip_urls=skip_urls)
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +152,7 @@ async def _scrape_keyword(
 
 
 async def _scrape_creator(
-    page: Page, handle: str, limit: int
+    page: Page, handle: str, limit: int, *, skip_urls: set[str] | None = None
 ) -> list[PostCandidate]:
     # XHS creator profiles use a userId path; handle may be a userId or username.
     # Try the user/profile path first; many tools store the numeric userId as handle.
@@ -143,10 +165,23 @@ async def _scrape_creator(
         return []
 
     await _assert_not_login_wall(page)
-    await _scroll_to_load_cards(page)
 
-    cards = await _collect_note_cards(page, limit * 2)
-    return await _harvest_notes(page, cards, limit, from_creator=True)
+    # Scroll progressively until we collect enough fresh candidates for this creator
+    _MAX_SCROLL_ROUNDS = 6
+    for scroll_round in range(1, _MAX_SCROLL_ROUNDS + 1):
+        await _scroll_to_load_cards(page, steps=scroll_round * 4)
+        cards = await _collect_note_cards(page, limit * (scroll_round + 1))
+        candidates = await _harvest_notes(page, cards, limit, from_creator=True, skip_urls=skip_urls)
+        if len(candidates) >= limit:
+            logger.debug("XHS creator %s: filled %d slots after %d scroll round(s).", handle, limit, scroll_round)
+            return candidates
+        logger.debug(
+            "XHS creator %s scroll round %d: %d/%d fresh candidates; scrolling deeper.",
+            handle, scroll_round, len(candidates), limit,
+        )
+
+    cards = await _collect_note_cards(page, limit * 8)
+    return await _harvest_notes(page, cards, limit, from_creator=True, skip_urls=skip_urls)
 
 
 # ---------------------------------------------------------------------------
@@ -231,9 +266,18 @@ async def _collect_note_cards(page: Page, limit: int) -> list[_NoteCard]:
 
 
 async def _harvest_notes(
-    page: Page, cards: list[_NoteCard], limit: int, *, from_creator: bool
+    page: Page,
+    cards: list[_NoteCard],
+    limit: int,
+    *,
+    from_creator: bool,
+    skip_urls: set[str] | None = None,
 ) -> list[PostCandidate]:
-    """Download cover images via HTTP and build PostCandidates — no page navigation needed."""
+    """Download cover images via HTTP and build PostCandidates — no page navigation needed.
+
+    Cards whose source_url is in *skip_urls* are skipped so we only return
+    posts that haven't been seen before.
+    """
     candidates: list[PostCandidate] = []
 
     # Grab cookies from the browser context to authenticate CDN image requests
@@ -244,6 +288,10 @@ async def _harvest_notes(
         for card in cards:
             if len(candidates) >= limit:
                 break
+            # Skip posts already present in the DB
+            if skip_urls and card.url in skip_urls:
+                logger.debug("XHS: skipping already-seen URL %s", card.url)
+                continue
             try:
                 resp = await client.get(
                     card.cover_img_url,

@@ -105,14 +105,17 @@ async def run_scrape(force: bool = False) -> None:
     xhs_candidates: list[PostCandidate] = []
     try:
         logger.info("Starting Xiaohongshu scrape (keyword=%r, handles=%s)", xhs_keyword, xhs_handles)
+        # Pass seen_urls so the scraper scrolls deeper when needed to find
+        # exactly _PER_PLATFORM fresh posts, rather than silently returning fewer.
         results = await scrape_xiaohongshu(
             keyword=xhs_keyword,
             creator_handles=xhs_handles,
-            max_results=_FETCH_LIMIT,
+            max_results=_PER_PLATFORM,
+            skip_urls=seen_urls,
         )
-        fresh = [c for c in results if c.source_url not in seen_urls]
-        xhs_candidates = _weighted_sample(fresh, _PER_PLATFORM)
-        logger.info("Xiaohongshu returned %d candidates (%d fresh, %d sampled).", len(results), len(fresh), len(xhs_candidates))
+        # Results are already deduplicated by the scraper; no extra filter needed.
+        xhs_candidates = _weighted_sample(results, _PER_PLATFORM)
+        logger.info("Xiaohongshu returned %d fresh candidates (%d sampled).", len(results), len(xhs_candidates))
     except SessionExpiredError:
         logger.warning("Xiaohongshu session expired — marking for re-auth.")
         _invalidate_session("xiaohongshu")

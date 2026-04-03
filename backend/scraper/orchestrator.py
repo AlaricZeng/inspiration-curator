@@ -90,7 +90,7 @@ async def run_scrape(force: bool = False) -> None:
         results = await _scrape_instagram(
             keyword=ig_keyword,
             creator_handles=ig_handles,
-            max_results=_PER_PLATFORM,
+            max_results=_FETCH_LIMIT,
             skip_urls=seen_urls,
         )
         ig_candidates = _weighted_sample(results, _PER_PLATFORM)

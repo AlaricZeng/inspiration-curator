@@ -203,14 +203,24 @@ def _scrape_hashtag(
     return candidates
 
 
-def _fetch_url(session: object, url: str) -> bytes:
-    try:
-        r = session.get(url, timeout=15)  # type: ignore[union-attr]
-        r.raise_for_status()
-        return r.content
-    except Exception as exc:
-        logger.debug("Failed to fetch image %s: %s", url, exc)
-        return b""
+def _fetch_url(session: object, url: str, *, retries: int = 3, backoff: float = 2.0) -> bytes:
+    """Fetch a URL with simple retry/backoff on failure."""
+    import time
+    last_exc: Exception | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            r = session.get(url, timeout=15)  # type: ignore[union-attr]
+            r.raise_for_status()
+            return r.content
+        except Exception as exc:
+            last_exc = exc
+            if attempt < retries:
+                sleep_for = backoff * attempt
+                logger.debug("Fetch attempt %d/%d failed for %s: %s — retrying in %.1fs",
+                             attempt, retries, url, exc, sleep_for)
+                time.sleep(sleep_for)
+    logger.debug("Failed to fetch image after %d attempts %s: %s", retries, url, last_exc)
+    return b""
 
 
 def _scrape_profile(

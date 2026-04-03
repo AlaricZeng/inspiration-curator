@@ -19,7 +19,6 @@ The other platform's scrape continues normally.
 
 from __future__ import annotations
 
-import asyncio
 import datetime as dt
 import logging
 import uuid
@@ -40,7 +39,7 @@ from backend.db.models import (
 )
 from backend.scraper.browser import PLATFORM_CONFIG
 from backend.scraper.errors import PostCandidate, SessionExpiredError
-from backend.scraper.instagram import scrape_instagram as _scrape_instagram_sync
+from backend.scraper.instagram import scrape_instagram as _scrape_instagram
 from backend.scraper.xiaohongshu import scrape_xiaohongshu
 
 logger = logging.getLogger(__name__)
@@ -78,13 +77,9 @@ async def run_scrape(force: bool = False) -> None:
     ig_candidates: list[PostCandidate] = []
     try:
         logger.info("Starting Instagram scrape (keyword=%r, handles=%s)", ig_keyword, ig_handles)
-        # instaloader is synchronous — run in a thread executor
-        results = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: _scrape_instagram_sync(
-                keyword=ig_keyword,
-                creator_handles=ig_handles,
-            ),
+        results = await _scrape_instagram(
+            keyword=ig_keyword,
+            creator_handles=ig_handles,
         )
         ig_candidates = results[:_PER_PLATFORM]
         logger.info("Instagram returned %d candidates.", len(ig_candidates))

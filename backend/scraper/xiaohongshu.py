@@ -200,6 +200,7 @@ async def _scrape_single_note(
 
         creator = await _creator_from_page(page)
         engagement = await _engagement_from_page(page)
+
         screenshot_data = await _screenshot_note(page)
 
         return PostCandidate(

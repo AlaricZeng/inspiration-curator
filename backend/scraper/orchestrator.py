@@ -50,8 +50,9 @@ STAGING_DIR = Path(__file__).parents[2] / "staging"
 
 # Maximum candidates saved per platform per run; 5 per platform = 10 total
 _PER_PLATFORM = 5
-# How many extra candidates to fetch to account for duplicates seen in prior runs
-_FETCH_MULTIPLIER = 4
+# How many candidates to fetch per platform before dedup + sampling
+# Large pool ensures we can still fill 5 slots even after heavy dedup
+_FETCH_LIMIT = 50
 
 
 # ---------------------------------------------------------------------------
@@ -79,7 +80,6 @@ async def run_scrape(force: bool = False) -> None:
 
     # Pre-load already-seen URLs so scrapers can avoid them
     seen_urls = _get_seen_urls()
-    fetch_limit = _PER_PLATFORM * _FETCH_MULTIPLIER
 
     # --- Instagram ---
     ig_candidates: list[PostCandidate] = []
@@ -88,11 +88,11 @@ async def run_scrape(force: bool = False) -> None:
         results = await _scrape_instagram(
             keyword=ig_keyword,
             creator_handles=ig_handles,
-            max_results=fetch_limit,
+            max_results=_FETCH_LIMIT,
         )
         fresh = [c for c in results if c.source_url not in seen_urls]
         ig_candidates = _weighted_sample(fresh, _PER_PLATFORM)
-        logger.info("Instagram returned %d candidates (%d after dedup, %d sampled).", len(results), len(fresh), len(ig_candidates))
+        logger.info("Instagram returned %d candidates (%d fresh, %d sampled).", len(results), len(fresh), len(ig_candidates))
     except SessionExpiredError:
         logger.warning("Instagram session expired — marking for re-auth.")
         _invalidate_instagram_session()
@@ -108,11 +108,11 @@ async def run_scrape(force: bool = False) -> None:
         results = await scrape_xiaohongshu(
             keyword=xhs_keyword,
             creator_handles=xhs_handles,
-            max_results=fetch_limit,
+            max_results=_FETCH_LIMIT,
         )
         fresh = [c for c in results if c.source_url not in seen_urls]
         xhs_candidates = _weighted_sample(fresh, _PER_PLATFORM)
-        logger.info("Xiaohongshu returned %d candidates (%d after dedup, %d sampled).", len(results), len(fresh), len(xhs_candidates))
+        logger.info("Xiaohongshu returned %d candidates (%d fresh, %d sampled).", len(results), len(fresh), len(xhs_candidates))
     except SessionExpiredError:
         logger.warning("Xiaohongshu session expired — marking for re-auth.")
         _invalidate_session("xiaohongshu")
@@ -138,16 +138,38 @@ async def run_scrape(force: bool = False) -> None:
 
 
 def _weighted_sample(candidates: list[PostCandidate], k: int) -> list[PostCandidate]:
-    """Return up to *k* candidates sampled with probability proportional to engagement.
+    """Return up to *k* unique candidates sampled without replacement,
+    with probability proportional to log(engagement + 2).
 
-    Uses log(engagement + 2) as the weight so that high-engagement posts are
-    favoured but low-engagement posts still have a real chance of appearing.
-    Avoids pure top-N determinism — each run draws a different mix.
+    High-engagement posts are favoured but not guaranteed — each run draws
+    a different mix. Falls back to taking all candidates if fewer than k exist.
     """
+    if not candidates:
+        return []
     if len(candidates) <= k:
-        return candidates
+        # Not enough to sample — shuffle so order varies across runs
+        shuffled = candidates.copy()
+        random.shuffle(shuffled)
+        return shuffled
+
     weights = [math.log(max(c.engagement, 0) + 2) for c in candidates]
-    return random.choices(candidates, weights=weights, k=k)
+    selected: list[PostCandidate] = []
+    pool = list(zip(weights, candidates))
+
+    while len(selected) < k and pool:
+        total = sum(w for w, _ in pool)
+        r = random.uniform(0, total)
+        cumulative = 0.0
+        chosen_idx = 0
+        for i, (w, _) in enumerate(pool):
+            cumulative += w
+            if cumulative >= r:
+                chosen_idx = i
+                break
+        _, chosen = pool.pop(chosen_idx)
+        selected.append(chosen)
+
+    return selected
 
 
 def _get_seen_urls() -> set[str]:

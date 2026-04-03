@@ -1,15 +1,17 @@
 """Gallery endpoint.
 
-GET /api/gallery — past liked posts grouped by date, newest first.
+GET    /api/gallery        — past liked posts grouped by date, newest first.
+DELETE /api/gallery/{id}   — permanently remove a liked post and its file.
 """
 
 from __future__ import annotations
 
 import logging
 from collections import defaultdict
+from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from sqlmodel import Session, select
 
@@ -63,3 +65,26 @@ async def get_gallery() -> list[GalleryDay]:
         GalleryDay(date=date, posts=posts)
         for date, posts in sorted(by_date.items(), reverse=True)
     ]
+
+
+@router.delete("/api/gallery/{post_id}", status_code=204)
+async def delete_gallery_post(post_id: str) -> None:
+    """Permanently delete a liked post: removes DB record and image file."""
+    with Session(engine) as session:
+        post = session.get(Post, post_id)
+        if post is None:
+            raise HTTPException(status_code=404, detail="Post not found")
+        if post.status != PostStatus.liked:
+            raise HTTPException(status_code=409, detail="Post is not in the gallery")
+
+        # Delete the image file (best-effort)
+        if post.screenshot:
+            try:
+                Path(post.screenshot).unlink(missing_ok=True)
+                logger.info("Deleted gallery image: %s", post.screenshot)
+            except Exception as exc:
+                logger.warning("Could not delete image file %s: %s", post.screenshot, exc)
+
+        session.delete(post)
+        session.commit()
+        logger.info("Deleted gallery post %s (@%s)", post_id, post.creator)

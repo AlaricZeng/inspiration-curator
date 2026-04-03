@@ -20,6 +20,7 @@ export default function Gallery() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [modal, setModal] = useState<GalleryPost | null>(null);
+  const [deleting, setDeleting] = useState(false);
 
   useEffect(() => {
     async function load() {
@@ -44,6 +45,25 @@ export default function Gallery() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, []);
+
+  const handleDelete = async (post: GalleryPost) => {
+    if (!window.confirm(`Delete post by @${post.creator}? This can't be undone.`)) return;
+    setDeleting(true);
+    try {
+      const res = await fetch(`/api/gallery/${post.id}`, { method: "DELETE" });
+      if (!res.ok) throw new Error("Failed to delete post");
+      setDays((prev) =>
+        prev
+          .map((day) => ({ ...day, posts: day.posts.filter((p) => p.id !== post.id) }))
+          .filter((day) => day.posts.length > 0)
+      );
+      setModal(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Unknown error");
+    } finally {
+      setDeleting(false);
+    }
+  };
 
   const totalPosts = days.reduce((n, d) => n + d.posts.length, 0);
 
@@ -118,6 +138,14 @@ export default function Gallery() {
               <span style={s.modalEngagement}>
                 {modal.engagement.toLocaleString()} engagements
               </span>
+              <button
+                style={{ ...s.deleteBtn, ...(deleting ? s.deleteBtnDisabled : {}) }}
+                onClick={() => void handleDelete(modal)}
+                disabled={deleting}
+                title="Delete from gallery"
+              >
+                {deleting ? "…" : "🗑"}
+              </button>
             </div>
           </div>
         </div>
@@ -263,4 +291,16 @@ const s: Record<string, CSSProperties> = {
   },
   modalCreator: { color: "#ccc", fontSize: "0.9rem", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
   modalEngagement: { color: "#555", fontSize: "0.8rem", marginLeft: "auto", whiteSpace: "nowrap" },
+  deleteBtn: {
+    background: "transparent",
+    border: "1px solid #3a1a1a",
+    borderRadius: 6,
+    color: "#c62828",
+    cursor: "pointer",
+    fontSize: "1rem",
+    padding: "0.15rem 0.5rem",
+    marginLeft: "0.5rem",
+    flexShrink: 0,
+  },
+  deleteBtnDisabled: { opacity: 0.4, cursor: "not-allowed" },
 };

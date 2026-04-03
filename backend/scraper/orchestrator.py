@@ -56,11 +56,15 @@ _PER_PLATFORM = 5
 # ---------------------------------------------------------------------------
 
 
-async def run_scrape() -> None:
-    """Execute a full scrape cycle.  Safe to call concurrently — a second call
-    while a run is already *running* will be a no-op for today's date."""
+async def run_scrape(force: bool = False) -> None:
+    """Execute a full scrape cycle.
+
+    Args:
+        force: When True (manual run), reset a completed/failed run so new posts
+               are always fetched.  When False (scheduler), skip if already done.
+    """
     today = dt.date.today()
-    run_id = _init_daily_run(today)
+    run_id = _init_daily_run(today, force=force)
     if run_id is None:
         logger.info("Scrape already running or completed for %s — skipping.", today)
         return
@@ -126,10 +130,12 @@ async def run_scrape() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _init_daily_run(today: dt.date) -> str | None:
-    """Create a new DailyRun for today (status=running) and return its id.
+def _init_daily_run(today: dt.date, force: bool = False) -> str | None:
+    """Create or reset today's DailyRun and return its id.
 
-    Returns None if a run already exists with status running or done.
+    - force=False (scheduler): skip if already running or done.
+    - force=True  (manual):    reset done/failed so a fresh run always proceeds.
+      A run already *running* is still skipped to avoid concurrent scrapes.
     """
     with Session(engine) as session:
         existing = session.exec(
@@ -137,9 +143,11 @@ def _init_daily_run(today: dt.date) -> str | None:
         ).first()
 
         if existing is not None:
-            if existing.status in (RunStatus.running, RunStatus.done):
-                return None
-            # Re-try a previously failed run
+            if existing.status == RunStatus.running:
+                return None  # never run concurrently
+            if existing.status == RunStatus.done and not force:
+                return None  # scheduler: skip
+            # force=True, or previously failed: reset and re-run
             existing.status = RunStatus.running
             session.add(existing)
             session.commit()

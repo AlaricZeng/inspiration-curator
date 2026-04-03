@@ -63,12 +63,15 @@ async def update_schedule(body: ScheduleUpdate) -> ScheduleResponse:
 
 @router.post("/api/run/now", response_model=RunNowResponse)
 async def run_now(background_tasks: BackgroundTasks) -> RunNowResponse:
-    """Trigger an immediate scrape in the background and return straight away."""
+    """Trigger an immediate scrape in the background and return straight away.
+
+    Always runs even if today already has a completed run (force=True).
+    """
     from backend.scraper.orchestrator import run_scrape  # lazy import
 
     async def _run() -> None:
         try:
-            await run_scrape()
+            await run_scrape(force=True)
         except Exception:
             logger.exception("Background run_now scrape failed.")
 

@@ -35,7 +35,7 @@ class Post(SQLModel, table=True):
     source_url: str
     creator: str
     screenshot: Optional[str] = None
-    scraped_at: dt.datetime = Field(default_factory=dt.datetime.utcnow)
+    scraped_at: dt.datetime = Field(default_factory=dt.datetime.now)
     status: PostStatus = Field(default=PostStatus.pending)
     engagement: int = Field(default=0)
 

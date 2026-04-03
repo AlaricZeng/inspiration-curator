@@ -17,7 +17,7 @@ from typing import Optional
 import instaloader
 
 from backend.scraper.errors import PostCandidate, SessionExpiredError
-from backend.scraper.instagram_loader import get_active_username, get_loader
+from backend.scraper.instagram_loader import get_any_loader
 
 logger = logging.getLogger(__name__)
 
@@ -38,12 +38,8 @@ def scrape_instagram(
         SessionExpiredError: session is invalid / expired.
         FileNotFoundError:   no session file — user must authenticate first.
     """
-    username = get_active_username()
-    if username is None:
-        raise FileNotFoundError("No Instagram session. Authenticate via POST /api/auth/instagram.")
-
     try:
-        L = get_loader(username)
+        L = get_any_loader()
     except instaloader.exceptions.BadCredentialsException:
         raise SessionExpiredError("instagram")
 

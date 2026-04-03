@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import math
+import random
 import uuid
 from pathlib import Path
 
@@ -88,8 +90,9 @@ async def run_scrape(force: bool = False) -> None:
             creator_handles=ig_handles,
             max_results=fetch_limit,
         )
-        ig_candidates = [c for c in results if c.source_url not in seen_urls][:_PER_PLATFORM]
-        logger.info("Instagram returned %d candidates (%d after dedup).", len(results), len(ig_candidates))
+        fresh = [c for c in results if c.source_url not in seen_urls]
+        ig_candidates = _weighted_sample(fresh, _PER_PLATFORM)
+        logger.info("Instagram returned %d candidates (%d after dedup, %d sampled).", len(results), len(fresh), len(ig_candidates))
     except SessionExpiredError:
         logger.warning("Instagram session expired — marking for re-auth.")
         _invalidate_instagram_session()
@@ -107,8 +110,9 @@ async def run_scrape(force: bool = False) -> None:
             creator_handles=xhs_handles,
             max_results=fetch_limit,
         )
-        xhs_candidates = [c for c in results if c.source_url not in seen_urls][:_PER_PLATFORM]
-        logger.info("Xiaohongshu returned %d candidates (%d after dedup).", len(results), len(xhs_candidates))
+        fresh = [c for c in results if c.source_url not in seen_urls]
+        xhs_candidates = _weighted_sample(fresh, _PER_PLATFORM)
+        logger.info("Xiaohongshu returned %d candidates (%d after dedup, %d sampled).", len(results), len(fresh), len(xhs_candidates))
     except SessionExpiredError:
         logger.warning("Xiaohongshu session expired — marking for re-auth.")
         _invalidate_session("xiaohongshu")
@@ -131,6 +135,19 @@ async def run_scrape(force: bool = False) -> None:
 # ---------------------------------------------------------------------------
 # DB helpers
 # ---------------------------------------------------------------------------
+
+
+def _weighted_sample(candidates: list[PostCandidate], k: int) -> list[PostCandidate]:
+    """Return up to *k* candidates sampled with probability proportional to engagement.
+
+    Uses log(engagement + 2) as the weight so that high-engagement posts are
+    favoured but low-engagement posts still have a real chance of appearing.
+    Avoids pure top-N determinism — each run draws a different mix.
+    """
+    if len(candidates) <= k:
+        return candidates
+    weights = [math.log(max(c.engagement, 0) + 2) for c in candidates]
+    return random.choices(candidates, weights=weights, k=k)
 
 
 def _get_seen_urls() -> set[str]:

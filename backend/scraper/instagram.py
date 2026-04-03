@@ -1,6 +1,8 @@
 """Instagram scraper using instaloader + Instagram's web API.
 
 Keyword mode:  fetches top posts for a hashtag via /api/v1/tags/web_info/
+               Paginates using next_max_id so runs 1-50, 51-100, … until
+               enough fresh posts are collected or the feed is exhausted.
 Creator mode:  fetches recent posts from each creator's profile
 
 Images are fetched at full resolution using image_versions2.candidates[0]
@@ -35,6 +37,9 @@ _IG_HEADERS = {
     ),
 }
 
+# Max pages to paginate through for hashtag "top" results (50 posts per page)
+_HASHTAG_MAX_PAGES = 5
+
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -50,8 +55,8 @@ async def scrape_instagram(
     """Scrape Instagram and return up to *max_results* fresh candidates ranked by engagement.
 
     Args:
-        skip_urls: Source URLs already seen in the DB — filtered out during
-                   collection so the caller receives only new posts.
+        skip_urls: Source URLs already seen in the DB — skipped during collection
+                   so the caller always receives only new posts.
 
     Raises:
         SessionExpiredError: session is invalid / expired.
@@ -71,7 +76,7 @@ async def scrape_instagram(
             tag = keyword.replace(" ", "").strip()
             if tag:
                 try:
-                    found = _scrape_hashtag(L, tag, max_results * 3, skip_urls=skip_urls)
+                    found = _scrape_hashtag(L, tag, max_results, skip_urls=skip_urls)
                     candidates.extend(found)
                 except instaloader.exceptions.LoginRequiredException:
                     raise SessionExpiredError("instagram")
@@ -109,38 +114,49 @@ def _scrape_hashtag(
     *,
     skip_urls: set[str] | None = None,
 ) -> list[PostCandidate]:
-    """Fetch posts from a hashtag via Instagram's web API v1.
+    """Fetch top posts for a hashtag, paginating through batches of ~50.
 
-    Tries "top" posts first; if we still need more, falls back to "recent"
-    posts from the same endpoint to fill the quota.
+    Stays exclusively within the "top" ranked feed. If page 1 (posts 1–50)
+    doesn't yield enough fresh posts, fetches page 2 (51–100), page 3, etc.,
+    up to _HASHTAG_MAX_PAGES. Never falls back to "recent".
     """
     tag = hashtag.lstrip("#")
     session = L.context._session
-    r = session.get(
-        f"https://www.instagram.com/api/v1/tags/web_info/?tag_name={tag}",
-        headers=_IG_HEADERS,
-        timeout=15,
-    )
-    r.raise_for_status()
-    data = r.json()
 
     seen_shortcodes: set[str] = set()
     candidates: list[PostCandidate] = []
+    next_max_id: str | None = None  # pagination cursor; None = first page
 
-    def _harvest_sections(sections: list) -> None:
+    for page_num in range(1, _HASHTAG_MAX_PAGES + 1):
+        url = f"https://www.instagram.com/api/v1/tags/web_info/?tag_name={tag}"
+        if next_max_id:
+            url += f"&next_max_id={next_max_id}"
+
+        try:
+            r = session.get(url, headers=_IG_HEADERS, timeout=15)
+            r.raise_for_status()
+            data = r.json()
+        except Exception as exc:
+            logger.warning("IG hashtag API error (page %d): %s", page_num, exc)
+            break
+
+        top = data.get("data", {}).get("top", {})
+        sections = top.get("sections", [])
+
+        page_new = 0
         for section in sections:
             for layout in section.get("layout_content", {}).get("medias", []):
-                if len(candidates) >= limit:
-                    return
                 media = layout.get("media", {})
                 shortcode = media.get("code") or media.get("shortcode")
                 if not shortcode or shortcode in seen_shortcodes:
                     continue
                 seen_shortcodes.add(shortcode)
+
                 source_url = f"https://www.instagram.com/p/{shortcode}/"
                 if skip_urls and source_url in skip_urls:
-                    logger.debug("IG: skipping already-seen URL %s", source_url)
+                    logger.debug("IG: skipping already-seen %s", source_url)
                     continue
+
                 creator = media.get("user", {}).get("username", "")
                 engagement = media.get("like_count", 0)
                 img_versions = media.get("image_versions2", {}).get("candidates", [])
@@ -148,6 +164,7 @@ def _scrape_hashtag(
                 screenshot_data = _fetch_url(session, thumb_url) if thumb_url else b""
                 if not screenshot_data:
                     continue
+
                 candidates.append(PostCandidate(
                     source_url=source_url,
                     creator=creator,
@@ -155,18 +172,22 @@ def _scrape_hashtag(
                     screenshot_data=screenshot_data,
                     from_creator=False,
                 ))
+                page_new += 1
 
-    # --- top posts first ---
-    top_sections = data.get("data", {}).get("top", {}).get("sections", [])
-    _harvest_sections(top_sections)
+                if len(candidates) >= limit:
+                    logger.debug("IG hashtag #%s: filled %d slots on page %d.", tag, limit, page_num)
+                    return candidates
 
-    # --- fall back to recent posts if still not enough ---
-    if len(candidates) < limit:
         logger.debug(
-            "IG hashtag #%s: only %d/%d from top; trying recent posts.", tag, len(candidates), limit
+            "IG hashtag #%s page %d: %d new fresh posts; total %d/%d.",
+            tag, page_num, page_new, len(candidates), limit,
         )
-        recent_sections = data.get("data", {}).get("recent", {}).get("sections", [])
-        _harvest_sections(recent_sections)
+
+        # Advance cursor — Instagram uses "next_max_id" inside the top object
+        next_max_id = top.get("next_max_id") or top.get("more_available_cursor")
+        if not next_max_id:
+            logger.debug("IG hashtag #%s: no more pages after page %d.", tag, page_num)
+            break
 
     return candidates
 

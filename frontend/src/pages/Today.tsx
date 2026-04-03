@@ -152,6 +152,8 @@ export default function Today() {
             </div>
           )}
 
+          {isRunning && <RunProgress />}
+
           {seedNeeded && (
             <div style={s.seedBox}>
               <p style={s.seedTitle}>Pick a starting style</p>
@@ -215,6 +217,42 @@ export default function Today() {
     </div>
   );
 }
+
+function RunProgress() {
+  return (
+    <div style={rp.wrap}>
+      <style>{`
+        @keyframes shimmer {
+          0%   { transform: translateX(-100%); }
+          100% { transform: translateX(250%); }
+        }
+      `}</style>
+      <div style={rp.track}>
+        <div style={rp.bar} />
+      </div>
+      <p style={rp.label}>Scraping posts… this takes a minute</p>
+    </div>
+  );
+}
+
+const rp: Record<string, CSSProperties> = {
+  wrap: { marginBottom: "1.5rem" },
+  track: {
+    height: 4,
+    background: "#1e1e1e",
+    borderRadius: 999,
+    overflow: "hidden",
+    marginBottom: "0.5rem",
+  },
+  bar: {
+    height: "100%",
+    width: "40%",
+    background: "linear-gradient(90deg, transparent, #7986cb, transparent)",
+    borderRadius: 999,
+    animation: "shimmer 1.6s ease-in-out infinite",
+  },
+  label: { color: "#555", fontSize: "0.75rem", margin: 0 },
+};
 
 function StatusChip({ status }: { status: string }) {
   const palette: Record<string, { bg: string; color: string; border: string }> = {

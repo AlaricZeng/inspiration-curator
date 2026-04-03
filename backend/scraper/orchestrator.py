@@ -272,6 +272,10 @@ def _persist_results(
                 except Exception as exc:
                     logger.warning("Failed to save screenshot %s: %s", filename, exc)
 
+            if screenshot_path is None:
+                logger.debug("Skipping post %s — no screenshot saved.", candidate.source_url)
+                continue
+
             post = Post(
                 platform=platform,
                 source_url=candidate.source_url,

@@ -38,7 +38,7 @@ _IG_HEADERS = {
 }
 
 # Max pages to paginate through for hashtag "top" results (50 posts per page)
-_HASHTAG_MAX_PAGES = 5
+_HASHTAG_MAX_PAGES = 10
 
 
 # ---------------------------------------------------------------------------
@@ -183,11 +183,22 @@ def _scrape_hashtag(
             tag, page_num, page_new, len(candidates), limit,
         )
 
-        # Advance cursor — Instagram uses "next_max_id" inside the top object
-        next_max_id = top.get("next_max_id") or top.get("more_available_cursor")
+        # Advance cursor.  Log all top-level keys the first time so we can
+        # confirm the real cursor field name from the API response.
+        if page_num == 1:
+            logger.info("IG hashtag top-object keys: %s", list(top.keys()))
+
+        next_max_id = (
+            top.get("next_max_id")
+            or top.get("more_available_cursor")
+            or top.get("next_cursor")
+            or top.get("end_cursor")
+        )
         if not next_max_id:
-            logger.debug("IG hashtag #%s: no more pages after page %d.", tag, page_num)
+            logger.debug("IG hashtag #%s: no pagination cursor after page %d (keys: %s).",
+                         tag, page_num, list(top.keys()))
             break
+        logger.debug("IG hashtag #%s: advancing to page %d with cursor %r.", tag, page_num + 1, next_max_id[:20])
 
     return candidates
 

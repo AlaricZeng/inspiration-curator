@@ -11,7 +11,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Response
 from pydantic import BaseModel
 from sqlmodel import Session, select
 
@@ -67,8 +67,8 @@ async def get_gallery() -> list[GalleryDay]:
     ]
 
 
-@router.delete("/api/gallery/{post_id}", status_code=204)
-async def delete_gallery_post(post_id: str) -> None:
+@router.delete("/api/gallery/{post_id}")
+async def delete_gallery_post(post_id: str) -> Response:
     """Permanently delete a liked post: removes DB record and image file."""
     with Session(engine) as session:
         post = session.get(Post, post_id)
@@ -88,3 +88,4 @@ async def delete_gallery_post(post_id: str) -> None:
         session.delete(post)
         session.commit()
         logger.info("Deleted gallery post %s (@%s)", post_id, post.creator)
+    return Response(status_code=204)

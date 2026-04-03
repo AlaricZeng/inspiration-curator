@@ -118,6 +118,7 @@ async def _scrape_keyword(
         return []
 
     await _assert_not_login_wall(page)
+    await _scroll_to_load_cards(page)
 
     cards = await _collect_note_cards(page, limit * 3)
     return await _harvest_notes(page, cards, limit, from_creator=False)
@@ -142,6 +143,7 @@ async def _scrape_creator(
         return []
 
     await _assert_not_login_wall(page)
+    await _scroll_to_load_cards(page)
 
     cards = await _collect_note_cards(page, limit * 2)
     return await _harvest_notes(page, cards, limit, from_creator=True)
@@ -150,6 +152,16 @@ async def _scrape_creator(
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
+
+
+async def _scroll_to_load_cards(page: Page, steps: int = 4) -> None:
+    """Scroll down incrementally to trigger lazy-loading of card images."""
+    for _ in range(steps):
+        await page.evaluate("window.scrollBy(0, 800)")
+        await page.wait_for_timeout(500)
+    # Scroll back to top so card order matches link order
+    await page.evaluate("window.scrollTo(0, 0)")
+    await page.wait_for_timeout(300)
 
 
 @dataclass
@@ -163,65 +175,57 @@ class _NoteCard:
 async def _collect_note_cards(page: Page, limit: int) -> list[_NoteCard]:
     """Return note cards (url + cover image URL) from the current listing page.
 
-    XHS renders a grid of cards; each card is an <a href="/explore/{id}"> that
-    contains an <img class=""> inside a parent with class "cover mask".
-    We grab both the note URL and the CDN image URL in one pass — no navigation
-    needed and no login wall to hit.
+    XHS uses a Vue component tree where the <a href="/explore/{id}"> and the
+    <img data-xhs-img elementtiming="card-exposed"> are siblings, not nested.
+    We collect them separately in DOM order and pair by index.
     """
     seen: set[str] = set()
     cards: list[_NoteCard] = []
 
-    link_patterns = ['a[href*="/explore/"]', 'a[href*="/discovery/item/"]']
-    for pattern in link_patterns:
+    # Collect all explore/discovery links in DOM order
+    note_urls: list[str] = []
+    for pattern in ['a[href*="/explore/"]', 'a[href*="/discovery/item/"]']:
         links = await page.query_selector_all(pattern)
         for link in links:
             try:
-                href = await link.get_attribute("href")
-                if not href:
-                    continue
+                href = await link.get_attribute("href") or ""
                 full_url = (href if href.startswith("http") else f"{_BASE}{href}").split("?")[0].rstrip("/")
-                if full_url in seen:
-                    continue
-
-                # Find the cover image inside this card link
-                img = await link.query_selector("img")
-                cover_src = ""
-                if img:
-                    cover_src = (await img.get_attribute("src") or "").strip()
-
-                # Skip if no cover image (probably a non-post link)
-                if not cover_src or cover_src.startswith("data:"):
-                    continue
-
-                seen.add(full_url)
-
-                # Try to read engagement count from the card
-                engagement = 0
-                like_el = await link.query_selector(".count, .like-count, span[class*='count']")
-                if like_el:
-                    try:
-                        txt = (await like_el.inner_text()).strip().replace(",", "")
-                        if txt.isdigit():
-                            engagement = int(txt)
-                        elif txt.endswith("万"):
-                            engagement = int(float(txt[:-1]) * 10_000)
-                    except Exception:
-                        pass
-
-                # Creator name from card if available
-                creator = ""
-                creator_el = await link.query_selector(".author-wrapper .name, .username, .nickname, .author-name")
-                if creator_el:
-                    try:
-                        creator = (await creator_el.inner_text()).strip()
-                    except Exception:
-                        pass
-
-                cards.append(_NoteCard(url=full_url, cover_img_url=cover_src, creator=creator, engagement=engagement))
-                if len(cards) >= limit:
-                    return cards
+                if full_url not in seen:
+                    seen.add(full_url)
+                    note_urls.append(full_url)
             except Exception:
                 continue
+
+    # Collect all post cover images (identified by XHS-specific attributes)
+    # These are the grid thumbnail images — NOT avatars
+    cover_srcs: list[str] = []
+    img_selectors = [
+        'img[data-xhs-img][elementtiming="card-exposed"]',  # primary: XHS card images
+        'img[data-xhs-img]',                                  # fallback: any xhs img
+    ]
+    for sel in img_selectors:
+        imgs = await page.query_selector_all(sel)
+        if imgs:
+            for img in imgs:
+                try:
+                    src = (await img.get_attribute("src") or "").strip()
+                    if src and not src.startswith("data:") and "avatar" not in src:
+                        cover_srcs.append(src)
+                except Exception:
+                    continue
+            break  # use whichever selector matched first
+
+    logger.debug("XHS: found %d note URLs, %d cover images", len(note_urls), len(cover_srcs))
+
+    # Pair by index — they appear in the same order in the DOM
+    for i, url in enumerate(note_urls):
+        if len(cards) >= limit:
+            break
+        cover_src = cover_srcs[i] if i < len(cover_srcs) else ""
+        if not cover_src:
+            logger.debug("XHS: no cover image for card %d (%s), skipping", i, url)
+            continue
+        cards.append(_NoteCard(url=url, cover_img_url=cover_src))
 
     return cards
 

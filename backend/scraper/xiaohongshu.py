@@ -280,20 +280,72 @@ async def _engagement_from_page(page: Page) -> int:
 
 
 async def _screenshot_note(page: Page) -> bytes:
-    """Screenshot the note image; fall back to viewport screenshot."""
-    img_selectors = [
-        ".note-detail img",
-        ".swiper-slide img",
-        "div.media-container img",
-        "main img",
+    """Screenshot the primary note image by navigating to the actual post URL.
+
+    Strategy:
+    1. Dismiss common overlays/popups (login nudges, cookie banners).
+    2. Wait for the main post image to be visible using specific selectors that
+       target the content area — skipping avatars and thumbnail grids.
+    3. Screenshot the element itself for a tight, accurate crop.
+    4. Fall back to a viewport screenshot if nothing matches.
+    """
+    # --- dismiss overlays that can obscure the image ---
+    overlay_close_selectors = [
+        'button[aria-label="关闭"]',
+        '.close-button',
+        '.modal-close',
+        '.login-close',
+        'button.close',
     ]
-    for sel in img_selectors:
+    for sel in overlay_close_selectors:
         try:
             el = await page.query_selector(sel)
-            if el:
-                return await el.screenshot()
+            if el and await el.is_visible():
+                await el.click()
+                await page.wait_for_timeout(500)
         except Exception:
             continue
+
+    # --- selectors ordered from most-specific to least-specific ---
+    # XHS note detail page typically renders the primary image inside:
+    #   .note-detail-mask  or  #noteContainer  or  .swiper-slide.swiper-slide-active
+    # Avatars live in .author-wrapper img / .avatar img — we explicitly skip those.
+    primary_img_selectors = [
+        # active slide in the carousel (most reliable for multi-image posts)
+        ".swiper-slide.swiper-slide-active img",
+        # single-image note container
+        "#noteContainer img",
+        ".note-detail-mask img",
+        # fallback: first img inside the note content block (not a thumbnail grid)
+        ".note-content img",
+        ".detail-content img",
+        "div[class*='note'] div[class*='media'] img",
+        # last resort: largest visible img on the page (skip tiny avatars < 100px)
+        "main img",
+    ]
+
+    for sel in primary_img_selectors:
+        try:
+            els = await page.query_selector_all(sel)
+            for el in els:
+                if not await el.is_visible():
+                    continue
+                box = await el.bounding_box()
+                if box is None:
+                    continue
+                # Skip tiny images (avatars, icons) — real post images are large
+                if box["width"] < 100 or box["height"] < 100:
+                    continue
+                # Scroll into view and wait briefly for lazy-load
+                await el.scroll_into_view_if_needed()
+                await page.wait_for_timeout(600)
+                data = await el.screenshot()
+                if data:
+                    return data
+        except Exception:
+            continue
+
+    # Final fallback: viewport screenshot
     try:
         return await page.screenshot(full_page=False)
     except Exception:

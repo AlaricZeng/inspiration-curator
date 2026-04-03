@@ -9,7 +9,7 @@ from pydantic import BaseModel
 
 import instaloader as _ig_lib
 
-from backend.scraper.browser import PLATFORM_CONFIG, create_session
+from backend.scraper.browser import PLATFORM_CONFIG, create_session, import_cookies
 from backend.scraper.browser import session_exists as xhs_session_exists
 import backend.scraper.instagram_loader as ig_loader
 
@@ -46,6 +46,10 @@ class StartAuthResponse(BaseModel):
 class InstagramLoginRequest(BaseModel):
     username: str
     password: str
+
+
+class CookieImportRequest(BaseModel):
+    cookies: list[dict]
 
 
 # ---------------------------------------------------------------------------
@@ -128,3 +132,22 @@ async def auth_xiaohongshu(background_tasks: BackgroundTasks) -> StartAuthRespon
 
     background_tasks.add_task(_run_xhs_login)
     return StartAuthResponse(started=True, platform="xiaohongshu")
+
+
+@router.post("/xiaohongshu/cookies", response_model=StartAuthResponse)
+async def import_xiaohongshu_cookies(body: CookieImportRequest) -> StartAuthResponse:
+    """Import cookies from Cookie-Editor JSON export — no browser popup needed."""
+    try:
+        import_cookies("xiaohongshu", body.cookies)
+        return StartAuthResponse(started=True, platform="xiaohongshu", detail="Cookies imported successfully.")
+    except Exception as exc:
+        _log.error("Xiaohongshu cookie import failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=400, detail=f"Cookie import failed: {exc}")
+
+
+@router.delete("/xiaohongshu", response_model=StartAuthResponse)
+async def logout_xiaohongshu() -> StartAuthResponse:
+    from pathlib import Path
+    session_file = Path(PLATFORM_CONFIG["xiaohongshu"]["session_file"])
+    session_file.unlink(missing_ok=True)
+    return StartAuthResponse(started=True, platform="xiaohongshu", detail="Session deleted.")

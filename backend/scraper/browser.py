@@ -40,6 +40,53 @@ def session_exists(platform: str) -> bool:
     return Path(config["session_file"]).exists()
 
 
+def import_cookies(platform: str, cookie_json: list | dict) -> None:
+    """Convert a Cookie-Editor export to Playwright storage state and save it.
+
+    Accepts either:
+      - A list of cookie objects  (Cookie-Editor "Export as JSON")
+      - {"cookies": [...]}        (same format used by sessions/instagram.json)
+
+    Saves to the platform's session_file in Playwright storage_state format.
+    """
+    import json as _json
+
+    # Normalise input to a flat list
+    if isinstance(cookie_json, dict):
+        raw_cookies = cookie_json.get("cookies", [])
+    else:
+        raw_cookies = cookie_json
+
+    _SAME_SITE_MAP = {
+        "no_restriction": "None",
+        "unspecified": "None",
+        "lax": "Lax",
+        "strict": "Strict",
+    }
+
+    pw_cookies = []
+    for c in raw_cookies:
+        same_site_raw = str(c.get("sameSite", "no_restriction")).lower()
+        pw_cookies.append({
+            "name": c["name"],
+            "value": c["value"],
+            "domain": c.get("domain", f".{platform}.com"),
+            "path": c.get("path", "/"),
+            "expires": c.get("expirationDate", c.get("expires", -1)),
+            "httpOnly": c.get("httpOnly", False),
+            "secure": c.get("secure", False),
+            "sameSite": _SAME_SITE_MAP.get(same_site_raw, "None"),
+        })
+
+    storage_state = {"cookies": pw_cookies, "origins": []}
+    session_file = Path(PLATFORM_CONFIG[platform]["session_file"])
+    session_file.write_text(_json.dumps(storage_state))
+    import logging
+    logging.getLogger(__name__).info(
+        "Imported %d cookies for %s → %s", len(pw_cookies), platform, session_file
+    )
+
+
 async def create_session(platform: str) -> None:
     """Open a visible browser, wait for the user to log in, then save the session.
 

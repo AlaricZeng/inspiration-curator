@@ -12,18 +12,28 @@ interface AuthStatusResponse {
   xiaohongshu: PlatformStatus;
 }
 
-const PLATFORMS: { key: keyof AuthStatusResponse; label: string; hint: string }[] = [
-  {
-    key: "instagram",
-    label: "Instagram",
-    hint: "Connect Instagram",
-  },
-  {
-    key: "xiaohongshu",
-    label: "小红书 (Xiaohongshu)",
-    hint: "Connect 小红书",
-  },
-];
+async function importXhsCookies(rawText: string): Promise<void> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawText);
+  } catch {
+    throw new Error("Invalid JSON — paste the full Cookie-Editor export.");
+  }
+  // Accept both [{...}, ...] and {"cookies": [...]}
+  const cookies = Array.isArray(parsed)
+    ? parsed
+    : (parsed as Record<string, unknown>).cookies;
+  if (!Array.isArray(cookies)) throw new Error("No cookie array found in pasted JSON.");
+  const res = await fetch("/api/auth/xiaohongshu/cookies", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ cookies }),
+  });
+  if (!res.ok) {
+    const data = (await res.json().catch(() => ({}))) as { detail?: string };
+    throw new Error(data.detail ?? "Cookie import failed.");
+  }
+}
 
 async function fetchStatus(): Promise<AuthStatusResponse> {
   const res = await fetch("/api/auth/status");
@@ -39,6 +49,8 @@ async function startAuth(platform: string): Promise<void> {
 export default function Setup() {
   const [status, setStatus] = useState<AuthStatusResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [xhsCookieText, setXhsCookieText] = useState("");
+  const [importingCookies, setImportingCookies] = useState(false);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const loadStatus = useCallback(async () => {
@@ -95,6 +107,21 @@ export default function Setup() {
     }
   };
 
+  const handleImportCookies = async () => {
+    if (!xhsCookieText.trim()) return;
+    setImportingCookies(true);
+    setError(null);
+    try {
+      await importXhsCookies(xhsCookieText);
+      setXhsCookieText("");
+      await loadStatus();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Cookie import failed.");
+    } finally {
+      setImportingCookies(false);
+    }
+  };
+
   return (
     <div style={styles.page}>
       <div style={styles.card}>
@@ -107,33 +134,68 @@ export default function Setup() {
         {error && <p style={styles.error}>{error}</p>}
 
         <div style={styles.platformList}>
-          {PLATFORMS.map(({ key, label, hint }) => {
-            const ps = status?.[key];
+          {/* Instagram row */}
+          {(() => {
+            const ps = status?.instagram;
             const authenticated = ps?.status === "authenticated";
             const connecting = ps?.connecting ?? false;
-
             return (
-              <div key={key} style={styles.platformRow}>
+              <div key="instagram" style={styles.platformRow}>
                 <div style={styles.platformInfo}>
-                  <span style={styles.platformLabel}>{label}</span>
+                  <span style={styles.platformLabel}>Instagram</span>
                   <StatusBadge authenticated={authenticated} connecting={connecting} />
                 </div>
-
                 {!authenticated && (
                   <button
-                    style={{
-                      ...styles.button,
-                      ...(connecting ? styles.buttonDisabled : {}),
-                    }}
+                    style={{ ...styles.button, ...(connecting ? styles.buttonDisabled : {}) }}
                     disabled={connecting}
-                    onClick={() => handleConnect(key)}
+                    onClick={() => void handleConnect("instagram")}
                   >
-                    {connecting ? "Browser opening…" : hint}
+                    {connecting ? "Browser opening…" : "Connect Instagram"}
                   </button>
                 )}
               </div>
             );
-          })}
+          })()}
+
+          {/* Xiaohongshu row — cookie import instead of browser popup */}
+          {(() => {
+            const ps = status?.xiaohongshu;
+            const authenticated = ps?.status === "authenticated";
+            return (
+              <div key="xiaohongshu" style={{ ...styles.platformRow, flexDirection: "column", alignItems: "stretch", gap: "0.85rem" }}>
+                <div style={styles.platformInfo}>
+                  <span style={styles.platformLabel}>小红书 (Xiaohongshu)</span>
+                  <StatusBadge authenticated={authenticated} connecting={false} />
+                </div>
+                {!authenticated && (
+                  <div style={styles.cookieBox}>
+                    <p style={styles.cookieHint}>
+                      Install{" "}
+                      <a href="https://chromewebstore.google.com/detail/cookie-editor/hlkenndednhfkekhgcdicdfddnkalmdm" target="_blank" rel="noreferrer" style={styles.link}>
+                        Cookie-Editor
+                      </a>
+                      , log in to xiaohongshu.com, then click <strong>Export → Export as JSON</strong> and paste below.
+                    </p>
+                    <textarea
+                      style={styles.textarea}
+                      placeholder='[{"name":"web_session","value":"..."}]'
+                      rows={4}
+                      value={xhsCookieText}
+                      onChange={(e) => setXhsCookieText(e.target.value)}
+                    />
+                    <button
+                      style={{ ...styles.button, ...(importingCookies || !xhsCookieText.trim() ? styles.buttonDisabled : {}) }}
+                      disabled={importingCookies || !xhsCookieText.trim()}
+                      onClick={() => void handleImportCookies()}
+                    >
+                      {importingCookies ? "Importing…" : "Import Cookies"}
+                    </button>
+                  </div>
+                )}
+              </div>
+            );
+          })()}
         </div>
 
         {status?.instagram.status === "authenticated" &&
@@ -269,5 +331,33 @@ const styles: Record<string, React.CSSProperties> = {
     borderRadius: "6px",
     color: "#4caf50",
     fontSize: "0.85rem",
+  },
+  cookieBox: {
+    display: "flex",
+    flexDirection: "column" as const,
+    gap: "0.6rem",
+  },
+  cookieHint: {
+    margin: 0,
+    color: "#666",
+    fontSize: "0.8rem",
+    lineHeight: 1.5,
+  },
+  link: {
+    color: "#7986cb",
+    textDecoration: "none",
+  },
+  textarea: {
+    background: "#0d0d0d",
+    border: "1px solid #2a2a2a",
+    borderRadius: "6px",
+    color: "#ccc",
+    fontSize: "0.78rem",
+    fontFamily: "monospace",
+    padding: "0.6rem 0.8rem",
+    resize: "vertical" as const,
+    outline: "none",
+    width: "100%",
+    boxSizing: "border-box" as const,
   },
 };

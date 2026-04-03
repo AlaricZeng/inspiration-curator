@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import logging.config
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncGenerator
@@ -19,6 +21,47 @@ from backend.routers.today import router as today_router
 from backend.scheduler import start_scheduler, stop_scheduler
 
 load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Logging — write INFO+ to console and to backend/app.log
+# ---------------------------------------------------------------------------
+_LOG_FILE = Path(__file__).parent / "app.log"
+
+logging.config.dictConfig({
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "default": {
+            "format": "%(asctime)s %(levelname)-8s %(name)s  %(message)s",
+            "datefmt": "%Y-%m-%d %H:%M:%S",
+        }
+    },
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "formatter": "default",
+            "level": "INFO",
+        },
+        "file": {
+            "class": "logging.FileHandler",
+            "filename": str(_LOG_FILE),
+            "formatter": "default",
+            "level": "DEBUG",
+            "encoding": "utf-8",
+        },
+    },
+    "root": {
+        "handlers": ["console", "file"],
+        "level": "DEBUG",
+    },
+    # Keep noisy third-party loggers quieter
+    "loggers": {
+        "uvicorn": {"level": "INFO", "propagate": True},
+        "uvicorn.access": {"level": "WARNING", "propagate": True},
+        "httpx": {"level": "WARNING", "propagate": True},
+        "playwright": {"level": "WARNING", "propagate": True},
+    },
+})
 
 # Directories that must exist before we mount them as static file trees
 _STAGING_DIR = Path(__file__).parents[1] / "staging"

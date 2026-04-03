@@ -12,9 +12,11 @@ Raises SessionExpiredError if a login wall is detected.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import quote, urlparse
 
+import httpx
 from playwright.async_api import Page, async_playwright
 
 from backend.scraper.browser import get_context
@@ -117,8 +119,8 @@ async def _scrape_keyword(
 
     await _assert_not_login_wall(page)
 
-    note_urls = await _collect_note_urls(page, limit * 3)
-    return await _harvest_notes(page, note_urls, limit, from_creator=False)
+    cards = await _collect_note_cards(page, limit * 3)
+    return await _harvest_notes(page, cards, limit, from_creator=False)
 
 
 # ---------------------------------------------------------------------------
@@ -141,8 +143,8 @@ async def _scrape_creator(
 
     await _assert_not_login_wall(page)
 
-    note_urls = await _collect_note_urls(page, limit * 2)
-    return await _harvest_notes(page, note_urls, limit, from_creator=True)
+    cards = await _collect_note_cards(page, limit * 2)
+    return await _harvest_notes(page, cards, limit, from_creator=True)
 
 
 # ---------------------------------------------------------------------------
@@ -150,203 +152,127 @@ async def _scrape_creator(
 # ---------------------------------------------------------------------------
 
 
-async def _collect_note_urls(page: Page, limit: int) -> list[str]:
-    """Return unique note/post URLs visible on the current page."""
-    seen: set[str] = set()
-    urls: list[str] = []
+@dataclass
+class _NoteCard:
+    url: str
+    cover_img_url: str
+    creator: str = ""
+    engagement: int = 0
 
-    # Note cards link to /explore/{noteId} or /discovery/item/{noteId}
+
+async def _collect_note_cards(page: Page, limit: int) -> list[_NoteCard]:
+    """Return note cards (url + cover image URL) from the current listing page.
+
+    XHS renders a grid of cards; each card is an <a href="/explore/{id}"> that
+    contains an <img class=""> inside a parent with class "cover mask".
+    We grab both the note URL and the CDN image URL in one pass — no navigation
+    needed and no login wall to hit.
+    """
+    seen: set[str] = set()
+    cards: list[_NoteCard] = []
+
     link_patterns = ['a[href*="/explore/"]', 'a[href*="/discovery/item/"]']
     for pattern in link_patterns:
         links = await page.query_selector_all(pattern)
         for link in links:
             try:
                 href = await link.get_attribute("href")
+                if not href:
+                    continue
+                full_url = (href if href.startswith("http") else f"{_BASE}{href}").split("?")[0].rstrip("/")
+                if full_url in seen:
+                    continue
+
+                # Find the cover image inside this card link
+                img = await link.query_selector("img")
+                cover_src = ""
+                if img:
+                    cover_src = (await img.get_attribute("src") or "").strip()
+
+                # Skip if no cover image (probably a non-post link)
+                if not cover_src or cover_src.startswith("data:"):
+                    continue
+
+                seen.add(full_url)
+
+                # Try to read engagement count from the card
+                engagement = 0
+                like_el = await link.query_selector(".count, .like-count, span[class*='count']")
+                if like_el:
+                    try:
+                        txt = (await like_el.inner_text()).strip().replace(",", "")
+                        if txt.isdigit():
+                            engagement = int(txt)
+                        elif txt.endswith("万"):
+                            engagement = int(float(txt[:-1]) * 10_000)
+                    except Exception:
+                        pass
+
+                # Creator name from card if available
+                creator = ""
+                creator_el = await link.query_selector(".author-wrapper .name, .username, .nickname, .author-name")
+                if creator_el:
+                    try:
+                        creator = (await creator_el.inner_text()).strip()
+                    except Exception:
+                        pass
+
+                cards.append(_NoteCard(url=full_url, cover_img_url=cover_src, creator=creator, engagement=engagement))
+                if len(cards) >= limit:
+                    return cards
             except Exception:
                 continue
-            if not href:
-                continue
-            full = href if href.startswith("http") else f"{_BASE}{href}"
-            full = full.split("?")[0].rstrip("/")
-            if full not in seen:
-                seen.add(full)
-                urls.append(full)
-            if len(urls) >= limit:
-                return urls
 
-    return urls
+    return cards
 
 
 async def _harvest_notes(
-    page: Page, note_urls: list[str], limit: int, *, from_creator: bool
+    page: Page, cards: list[_NoteCard], limit: int, *, from_creator: bool
 ) -> list[PostCandidate]:
+    """Download cover images via HTTP and build PostCandidates — no page navigation needed."""
     candidates: list[PostCandidate] = []
-    for url in note_urls:
-        if len(candidates) >= limit:
-            break
-        candidate = await _scrape_single_note(page, url, from_creator=from_creator)
-        if candidate is not None:
-            candidates.append(candidate)
+
+    # Grab cookies from the browser context to authenticate CDN image requests
+    cookies = await page.context.cookies()
+    cookie_header = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
+
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+        for card in cards:
+            if len(candidates) >= limit:
+                break
+            try:
+                resp = await client.get(
+                    card.cover_img_url,
+                    headers={
+                        "Referer": "https://www.xiaohongshu.com/",
+                        "Cookie": cookie_header,
+                        "User-Agent": (
+                            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/124.0.0.0 Safari/537.36"
+                        ),
+                    },
+                )
+                if resp.status_code == 200 and resp.content:
+                    screenshot_data = resp.content
+                else:
+                    logger.debug("XHS cover image fetch failed %s: HTTP %s", card.cover_img_url, resp.status_code)
+                    screenshot_data = b""
+            except Exception as exc:
+                logger.debug("XHS cover image download error for %s: %s", card.url, exc)
+                screenshot_data = b""
+
+            if not screenshot_data:
+                continue
+
+            candidates.append(PostCandidate(
+                source_url=card.url,
+                creator=card.creator,
+                engagement=card.engagement,
+                screenshot_data=screenshot_data,
+                from_creator=from_creator,
+            ))
+
     return candidates
 
 
-async def _scrape_single_note(
-    page: Page, note_url: str, *, from_creator: bool
-) -> Optional[PostCandidate]:
-    try:
-        await page.goto(note_url, wait_until="domcontentloaded", timeout=20_000)
-        await page.wait_for_timeout(1_500)
-        await _assert_not_login_wall(page)
-
-        creator = await _creator_from_page(page)
-        engagement = await _engagement_from_page(page)
-
-        screenshot_data = await _screenshot_note(page)
-
-        return PostCandidate(
-            source_url=note_url,
-            creator=creator,
-            engagement=engagement,
-            screenshot_data=screenshot_data,
-            from_creator=from_creator,
-        )
-    except SessionExpiredError:
-        raise
-    except Exception as exc:
-        logger.debug("Failed to scrape XHS note %s: %s", note_url, exc)
-        return None
-
-
-async def _creator_from_page(page: Page) -> str:
-    """Try several selectors to extract the creator's handle / display name."""
-    selectors = [
-        ".author-wrapper .username",
-        ".author .name",
-        'a[href*="/user/profile/"] span',
-        ".user-name",
-        ".nickname",
-    ]
-    for sel in selectors:
-        try:
-            el = await page.query_selector(sel)
-            if el:
-                text = (await el.inner_text()).strip()
-                if text:
-                    return text
-        except Exception:
-            continue
-    return ""
-
-
-async def _engagement_from_page(page: Page) -> int:
-    """Return combined 点赞数 + 收藏数; fall back to 0."""
-    total = 0
-
-    # Selectors for like (点赞) count
-    like_selectors = [
-        ".like-wrapper .count",
-        ".likes .count",
-        'span[class*="like"] span',
-        'div[class*="like"] span.count',
-    ]
-    # Selectors for collect/save (收藏) count
-    collect_selectors = [
-        ".collect-wrapper .count",
-        ".collect .count",
-        'span[class*="collect"] span',
-        'div[class*="collect"] span.count',
-    ]
-
-    for group in (like_selectors, collect_selectors):
-        for sel in group:
-            try:
-                el = await page.query_selector(sel)
-                if el:
-                    text = (await el.inner_text()).strip().replace(",", "")
-                    if text.isdigit():
-                        total += int(text)
-                        break
-                    # Handle abbreviated counts like "1.2万" (12 000)
-                    if text.endswith("万"):
-                        try:
-                            total += int(float(text[:-1]) * 10_000)
-                        except ValueError:
-                            pass
-                        break
-            except Exception:
-                continue
-
-    return total
-
-
-async def _screenshot_note(page: Page) -> bytes:
-    """Screenshot the primary note image by navigating to the actual post URL.
-
-    Strategy:
-    1. Dismiss common overlays/popups (login nudges, cookie banners).
-    2. Wait for the main post image to be visible using specific selectors that
-       target the content area — skipping avatars and thumbnail grids.
-    3. Screenshot the element itself for a tight, accurate crop.
-    4. Fall back to a viewport screenshot if nothing matches.
-    """
-    # --- dismiss overlays that can obscure the image ---
-    overlay_close_selectors = [
-        'button[aria-label="关闭"]',
-        '.close-button',
-        '.modal-close',
-        '.login-close',
-        'button.close',
-    ]
-    for sel in overlay_close_selectors:
-        try:
-            el = await page.query_selector(sel)
-            if el and await el.is_visible():
-                await el.click()
-                await page.wait_for_timeout(500)
-        except Exception:
-            continue
-
-    # --- selectors ordered from most-specific to least-specific ---
-    # XHS note detail page typically renders the primary image inside:
-    #   .note-detail-mask  or  #noteContainer  or  .swiper-slide.swiper-slide-active
-    # Avatars live in .author-wrapper img / .avatar img — we explicitly skip those.
-    primary_img_selectors = [
-        # active slide in the carousel (most reliable for multi-image posts)
-        ".swiper-slide.swiper-slide-active img",
-        # single-image note container
-        "#noteContainer img",
-        ".note-detail-mask img",
-        # fallback: first img inside the note content block (not a thumbnail grid)
-        ".note-content img",
-        ".detail-content img",
-        "div[class*='note'] div[class*='media'] img",
-        # last resort: largest visible img on the page (skip tiny avatars < 100px)
-        "main img",
-    ]
-
-    for sel in primary_img_selectors:
-        try:
-            els = await page.query_selector_all(sel)
-            for el in els:
-                if not await el.is_visible():
-                    continue
-                box = await el.bounding_box()
-                if box is None:
-                    continue
-                # Skip tiny images (avatars, icons) — real post images are large
-                if box["width"] < 100 or box["height"] < 100:
-                    continue
-                # Scroll into view and wait briefly for lazy-load
-                await el.scroll_into_view_if_needed()
-                await page.wait_for_timeout(600)
-                data = await el.screenshot()
-                if data:
-                    return data
-        except Exception:
-            continue
-
-    # Final fallback: viewport screenshot
-    try:
-        return await page.screenshot(full_page=False)
-    except Exception:
-        return b""

@@ -45,8 +45,13 @@ async def scrape_instagram(
     keyword: str | None,
     creator_handles: list[str],
     max_results: int = 10,
+    skip_urls: set[str] | None = None,
 ) -> list[PostCandidate]:
-    """Scrape Instagram and return up to *max_results* candidates ranked by engagement.
+    """Scrape Instagram and return up to *max_results* fresh candidates ranked by engagement.
+
+    Args:
+        skip_urls: Source URLs already seen in the DB — filtered out during
+                   collection so the caller receives only new posts.
 
     Raises:
         SessionExpiredError: session is invalid / expired.
@@ -66,7 +71,7 @@ async def scrape_instagram(
             tag = keyword.replace(" ", "").strip()
             if tag:
                 try:
-                    found = _scrape_hashtag(L, tag, max_results * 2)
+                    found = _scrape_hashtag(L, tag, max_results * 3, skip_urls=skip_urls)
                     candidates.extend(found)
                 except instaloader.exceptions.LoginRequiredException:
                     raise SessionExpiredError("instagram")
@@ -77,7 +82,9 @@ async def scrape_instagram(
             if len(candidates) >= max_results:
                 break
             try:
-                found = _scrape_profile(L, handle, max_results - len(candidates))
+                found = _scrape_profile(
+                    L, handle, max_results - len(candidates), skip_urls=skip_urls
+                )
                 candidates.extend(found)
             except instaloader.exceptions.LoginRequiredException:
                 raise SessionExpiredError("instagram")
@@ -96,9 +103,17 @@ async def scrape_instagram(
 
 
 def _scrape_hashtag(
-    L: instaloader.Instaloader, hashtag: str, limit: int
+    L: instaloader.Instaloader,
+    hashtag: str,
+    limit: int,
+    *,
+    skip_urls: set[str] | None = None,
 ) -> list[PostCandidate]:
-    """Fetch top posts from a hashtag via Instagram's web API v1."""
+    """Fetch posts from a hashtag via Instagram's web API v1.
+
+    Tries "top" posts first; if we still need more, falls back to "recent"
+    posts from the same endpoint to fill the quota.
+    """
     tag = hashtag.lstrip("#")
     session = L.context._session
     r = session.get(
@@ -109,30 +124,49 @@ def _scrape_hashtag(
     r.raise_for_status()
     data = r.json()
 
+    seen_shortcodes: set[str] = set()
     candidates: list[PostCandidate] = []
-    sections = data.get("data", {}).get("top", {}).get("sections", [])
-    for section in sections:
-        for layout in section.get("layout_content", {}).get("medias", []):
-            if len(candidates) >= limit:
-                break
-            media = layout.get("media", {})
-            shortcode = media.get("code") or media.get("shortcode")
-            if not shortcode:
-                continue
-            source_url = f"https://www.instagram.com/p/{shortcode}/"
-            creator = media.get("user", {}).get("username", "")
-            engagement = media.get("like_count", 0)
-            # candidates[0] is the largest resolution (e.g. 1206x1508)
-            img_versions = media.get("image_versions2", {}).get("candidates", [])
-            thumb_url = img_versions[0].get("url") if img_versions else None
-            screenshot_data = _fetch_url(session, thumb_url) if thumb_url else b""
-            candidates.append(PostCandidate(
-                source_url=source_url,
-                creator=creator,
-                engagement=engagement,
-                screenshot_data=screenshot_data,
-                from_creator=False,
-            ))
+
+    def _harvest_sections(sections: list) -> None:
+        for section in sections:
+            for layout in section.get("layout_content", {}).get("medias", []):
+                if len(candidates) >= limit:
+                    return
+                media = layout.get("media", {})
+                shortcode = media.get("code") or media.get("shortcode")
+                if not shortcode or shortcode in seen_shortcodes:
+                    continue
+                seen_shortcodes.add(shortcode)
+                source_url = f"https://www.instagram.com/p/{shortcode}/"
+                if skip_urls and source_url in skip_urls:
+                    logger.debug("IG: skipping already-seen URL %s", source_url)
+                    continue
+                creator = media.get("user", {}).get("username", "")
+                engagement = media.get("like_count", 0)
+                img_versions = media.get("image_versions2", {}).get("candidates", [])
+                thumb_url = img_versions[0].get("url") if img_versions else None
+                screenshot_data = _fetch_url(session, thumb_url) if thumb_url else b""
+                if not screenshot_data:
+                    continue
+                candidates.append(PostCandidate(
+                    source_url=source_url,
+                    creator=creator,
+                    engagement=engagement,
+                    screenshot_data=screenshot_data,
+                    from_creator=False,
+                ))
+
+    # --- top posts first ---
+    top_sections = data.get("data", {}).get("top", {}).get("sections", [])
+    _harvest_sections(top_sections)
+
+    # --- fall back to recent posts if still not enough ---
+    if len(candidates) < limit:
+        logger.debug(
+            "IG hashtag #%s: only %d/%d from top; trying recent posts.", tag, len(candidates), limit
+        )
+        recent_sections = data.get("data", {}).get("recent", {}).get("sections", [])
+        _harvest_sections(recent_sections)
 
     return candidates
 
@@ -148,15 +182,23 @@ def _fetch_url(session: object, url: str) -> bytes:
 
 
 def _scrape_profile(
-    L: instaloader.Instaloader, handle: str, limit: int
+    L: instaloader.Instaloader,
+    handle: str,
+    limit: int,
+    *,
+    skip_urls: set[str] | None = None,
 ) -> list[PostCandidate]:
-    """Fetch recent posts from a creator profile."""
+    """Fetch recent posts from a creator profile, skipping already-seen URLs."""
     profile = instaloader.Profile.from_username(L.context, handle.lstrip("@"))
     candidates: list[PostCandidate] = []
 
     for post in profile.get_posts():
         if len(candidates) >= limit:
             break
+        source_url = f"https://www.instagram.com/p/{post.shortcode}/"
+        if skip_urls and source_url in skip_urls:
+            logger.debug("IG: skipping already-seen profile post %s", source_url)
+            continue
         c = _post_to_candidate(L, post, from_creator=True)
         if c:
             candidates.append(c)

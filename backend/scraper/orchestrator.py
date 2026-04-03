@@ -85,14 +85,16 @@ async def run_scrape(force: bool = False) -> None:
     ig_candidates: list[PostCandidate] = []
     try:
         logger.info("Starting Instagram scrape (keyword=%r, handles=%s)", ig_keyword, ig_handles)
+        # Pass seen_urls so the scraper skips dupes during collection and
+        # falls back to recent posts if top posts don't fill the quota.
         results = await _scrape_instagram(
             keyword=ig_keyword,
             creator_handles=ig_handles,
-            max_results=_FETCH_LIMIT,
+            max_results=_PER_PLATFORM,
+            skip_urls=seen_urls,
         )
-        fresh = [c for c in results if c.source_url not in seen_urls]
-        ig_candidates = _weighted_sample(fresh, _PER_PLATFORM)
-        logger.info("Instagram returned %d candidates (%d fresh, %d sampled).", len(results), len(fresh), len(ig_candidates))
+        ig_candidates = _weighted_sample(results, _PER_PLATFORM)
+        logger.info("Instagram returned %d fresh candidates (%d sampled).", len(results), len(ig_candidates))
     except SessionExpiredError:
         logger.warning("Instagram session expired — marking for re-auth.")
         _invalidate_instagram_session()

@@ -46,13 +46,16 @@ def scrape_instagram(
     candidates: list[PostCandidate] = []
 
     if keyword:
-        try:
-            found = _scrape_hashtag(L, keyword, max_results * 2)
-            candidates.extend(found)
-        except instaloader.exceptions.LoginRequiredException:
-            raise SessionExpiredError("instagram")
-        except Exception as exc:
-            logger.warning("Instagram hashtag scrape failed: %s", exc)
+        # Hashtags can't have spaces — use only the first word, or skip if empty
+        tag = keyword.replace(" ", "").strip()
+        if tag:
+            try:
+                found = _scrape_hashtag(L, tag, max_results * 2)
+                candidates.extend(found)
+            except instaloader.exceptions.LoginRequiredException:
+                raise SessionExpiredError("instagram")
+            except Exception as exc:
+                logger.warning("Instagram hashtag scrape failed for #%s: %s", tag, exc)
 
     for handle in creator_handles:
         if len(candidates) >= max_results:
@@ -73,22 +76,70 @@ def scrape_instagram(
 # Synchronous scraping helpers (instaloader is synchronous)
 # ---------------------------------------------------------------------------
 
+_IG_HEADERS = {
+    "x-ig-app-id": "936619743392459",
+    "x-requested-with": "XMLHttpRequest",
+    "referer": "https://www.instagram.com/",
+    "user-agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/122.0.0.0 Safari/537.36"
+    ),
+}
+
 
 def _scrape_hashtag(
     L: instaloader.Instaloader, hashtag: str, limit: int
 ) -> list[PostCandidate]:
-    """Fetch top posts from a hashtag."""
-    tag = instaloader.Hashtag.from_name(L.context, hashtag.lstrip("#"))
-    candidates: list[PostCandidate] = []
+    """Fetch top posts from a hashtag via Instagram's web API v1."""
+    tag = hashtag.lstrip("#")
+    session = L.context._session
+    r = session.get(
+        f"https://www.instagram.com/api/v1/tags/web_info/?tag_name={tag}",
+        headers=_IG_HEADERS,
+        timeout=15,
+    )
+    r.raise_for_status()
+    data = r.json()
 
-    for post in tag.get_top_posts():
-        if len(candidates) >= limit:
-            break
-        c = _post_to_candidate(L, post, from_creator=False)
-        if c:
-            candidates.append(c)
+    candidates: list[PostCandidate] = []
+    sections = data.get("data", {}).get("top", {}).get("sections", [])
+    for section in sections:
+        for layout in section.get("layout_content", {}).get("medias", []):
+            if len(candidates) >= limit:
+                break
+            media = layout.get("media", {})
+            shortcode = media.get("code") or media.get("shortcode")
+            if not shortcode:
+                continue
+            source_url = f"https://www.instagram.com/p/{shortcode}/"
+            creator = media.get("user", {}).get("username", "")
+            engagement = media.get("like_count", 0)
+            # Grab thumbnail URL
+            thumb_url = None
+            img_versions = media.get("image_versions2", {}).get("candidates", [])
+            if img_versions:
+                thumb_url = img_versions[-1].get("url")  # smallest thumbnail
+            screenshot_data = _fetch_url(session, thumb_url) if thumb_url else b""
+            candidates.append(PostCandidate(
+                source_url=source_url,
+                creator=creator,
+                engagement=engagement,
+                screenshot_data=screenshot_data,
+                from_creator=False,
+            ))
 
     return candidates
+
+
+def _fetch_url(session: object, url: str) -> bytes:
+    try:
+        r = session.get(url, timeout=10)  # type: ignore[union-attr]
+        r.raise_for_status()
+        return r.content
+    except Exception as exc:
+        logger.debug("Failed to fetch image %s: %s", url, exc)
+        return b""
 
 
 def _scrape_profile(

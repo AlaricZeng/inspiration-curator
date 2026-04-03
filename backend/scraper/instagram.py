@@ -1,28 +1,25 @@
-"""Instagram scraper using Playwright with a saved authenticated session.
+"""Instagram scraper using instaloader (no browser required).
 
-Keyword mode:  visits instagram.com/explore/tags/{keyword} and collects posts
-               from the explore grid.
-Creator mode:  visits each creator's profile and collects their latest posts.
+Keyword mode:  fetches posts from instagram.com/explore/tags/{keyword}
+Creator mode:  fetches recent posts from each creator's profile
 
 Returns up to *max_results* PostCandidates ranked by engagement (highest first).
-Raises SessionExpiredError if a login wall is detected.
+Raises SessionExpiredError if instaloader reports the session is invalid.
+Raises FileNotFoundError if no session file exists yet.
 """
 
 from __future__ import annotations
 
+import io
 import logging
 from typing import Optional
-from urllib.parse import urlparse
 
-from playwright.async_api import Page, async_playwright
+import instaloader
 
-from backend.scraper.browser import get_context
 from backend.scraper.errors import PostCandidate, SessionExpiredError
+from backend.scraper.instagram_loader import get_active_username, get_loader
 
 logger = logging.getLogger(__name__)
-
-_BASE = "https://www.instagram.com"
-_LOGIN_FRAGMENTS = ("/accounts/login", "/accounts/emailsignup")
 
 
 # ---------------------------------------------------------------------------
@@ -30,7 +27,7 @@ _LOGIN_FRAGMENTS = ("/accounts/login", "/accounts/emailsignup")
 # ---------------------------------------------------------------------------
 
 
-async def scrape_instagram(
+def scrape_instagram(
     keyword: str | None,
     creator_handles: list[str],
     max_results: int = 10,
@@ -38,221 +35,123 @@ async def scrape_instagram(
     """Scrape Instagram and return up to *max_results* candidates ranked by engagement.
 
     Raises:
-        SessionExpiredError: login wall detected during scraping.
+        SessionExpiredError: session is invalid / expired.
         FileNotFoundError:   no session file — user must authenticate first.
     """
+    username = get_active_username()
+    if username is None:
+        raise FileNotFoundError("No Instagram session. Authenticate via POST /api/auth/instagram.")
+
+    try:
+        L = get_loader(username)
+    except instaloader.exceptions.BadCredentialsException:
+        raise SessionExpiredError("instagram")
+
     candidates: list[PostCandidate] = []
 
-    async with async_playwright() as pw:
-        context = await get_context("instagram", pw)
+    if keyword:
         try:
-            page = await context.new_page()
-            page.set_default_timeout(20_000)
+            found = _scrape_hashtag(L, keyword, max_results * 2)
+            candidates.extend(found)
+        except instaloader.exceptions.LoginRequiredException:
+            raise SessionExpiredError("instagram")
+        except Exception as exc:
+            logger.warning("Instagram hashtag scrape failed: %s", exc)
 
-            if keyword:
-                found = await _scrape_keyword(page, keyword, max_results)
-                candidates.extend(found)
-
-            for handle in creator_handles:
-                if len(candidates) >= max_results:
-                    break
-                found = await _scrape_creator(page, handle, max_results - len(candidates))
-                candidates.extend(found)
-
-        finally:
-            await context.browser.close()
+    for handle in creator_handles:
+        if len(candidates) >= max_results:
+            break
+        try:
+            found = _scrape_profile(L, handle, max_results - len(candidates))
+            candidates.extend(found)
+        except instaloader.exceptions.LoginRequiredException:
+            raise SessionExpiredError("instagram")
+        except Exception as exc:
+            logger.warning("Instagram profile scrape failed for %s: %s", handle, exc)
 
     candidates.sort(key=lambda c: c.engagement, reverse=True)
     return candidates[:max_results]
 
 
 # ---------------------------------------------------------------------------
-# Login wall detection
+# Synchronous scraping helpers (instaloader is synchronous)
 # ---------------------------------------------------------------------------
 
 
-def _is_login_url(url: str) -> bool:
-    path = urlparse(url).path
-    return any(path.startswith(frag) for frag in _LOGIN_FRAGMENTS)
-
-
-async def _assert_not_login_wall(page: Page) -> None:
-    if _is_login_url(page.url):
-        raise SessionExpiredError("instagram")
-    # Secondary check: login form present
-    try:
-        el = await page.query_selector('input[name="username"]')
-        if el is not None:
-            raise SessionExpiredError("instagram")
-    except SessionExpiredError:
-        raise
-    except Exception:
-        pass
-
-
-# ---------------------------------------------------------------------------
-# Keyword scrape
-# ---------------------------------------------------------------------------
-
-
-async def _scrape_keyword(
-    page: Page, keyword: str, limit: int
+def _scrape_hashtag(
+    L: instaloader.Instaloader, hashtag: str, limit: int
 ) -> list[PostCandidate]:
-    url = f"{_BASE}/explore/tags/{keyword}/"
-    try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-    except Exception as exc:
-        logger.warning("Instagram keyword navigation failed: %s", exc)
-        return []
-
-    await _assert_not_login_wall(page)
-
-    hrefs = await _collect_post_hrefs(page, limit * 3)
-    return await _harvest_posts(page, hrefs, limit, from_creator=False)
-
-
-# ---------------------------------------------------------------------------
-# Creator profile scrape
-# ---------------------------------------------------------------------------
-
-
-async def _scrape_creator(
-    page: Page, handle: str, limit: int
-) -> list[PostCandidate]:
-    url = f"{_BASE}/{handle.lstrip('@')}/"
-    try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-    except Exception as exc:
-        logger.warning("Instagram creator navigation failed for %s: %s", handle, exc)
-        return []
-
-    await _assert_not_login_wall(page)
-
-    hrefs = await _collect_post_hrefs(page, limit * 2)
-    return await _harvest_posts(page, hrefs, limit, from_creator=True)
-
-
-# ---------------------------------------------------------------------------
-# Shared helpers
-# ---------------------------------------------------------------------------
-
-
-async def _collect_post_hrefs(page: Page, limit: int) -> list[str]:
-    """Return unique post URLs found on the current page."""
-    seen: set[str] = set()
-    hrefs: list[str] = []
-
-    links = await page.query_selector_all('a[href*="/p/"]')
-    for link in links:
-        try:
-            href = await link.get_attribute("href")
-        except Exception:
-            continue
-        if not href:
-            continue
-        full = href if href.startswith("http") else f"{_BASE}{href}"
-        full = full.split("?")[0].rstrip("/")
-        if full not in seen:
-            seen.add(full)
-            hrefs.append(full)
-        if len(hrefs) >= limit:
-            break
-
-    return hrefs
-
-
-async def _harvest_posts(
-    page: Page, hrefs: list[str], limit: int, *, from_creator: bool
-) -> list[PostCandidate]:
+    """Fetch top posts from a hashtag."""
+    tag = instaloader.Hashtag.from_name(L.context, hashtag.lstrip("#"))
     candidates: list[PostCandidate] = []
-    for post_url in hrefs:
+
+    for post in tag.get_top_posts():
         if len(candidates) >= limit:
             break
-        candidate = await _scrape_single_post(page, post_url, from_creator=from_creator)
-        if candidate is not None:
-            candidates.append(candidate)
+        c = _post_to_candidate(L, post, from_creator=False)
+        if c:
+            candidates.append(c)
+
     return candidates
 
 
-async def _scrape_single_post(
-    page: Page, post_url: str, *, from_creator: bool
+def _scrape_profile(
+    L: instaloader.Instaloader, handle: str, limit: int
+) -> list[PostCandidate]:
+    """Fetch recent posts from a creator profile."""
+    profile = instaloader.Profile.from_username(L.context, handle.lstrip("@"))
+    candidates: list[PostCandidate] = []
+
+    for post in profile.get_posts():
+        if len(candidates) >= limit:
+            break
+        c = _post_to_candidate(L, post, from_creator=True)
+        if c:
+            candidates.append(c)
+
+    return candidates
+
+
+def _post_to_candidate(
+    L: instaloader.Instaloader,
+    post: instaloader.Post,
+    *,
+    from_creator: bool,
 ) -> Optional[PostCandidate]:
     try:
-        await page.goto(post_url, wait_until="domcontentloaded", timeout=20_000)
-        await _assert_not_login_wall(page)
+        source_url = f"https://www.instagram.com/p/{post.shortcode}/"
+        creator = post.owner_username
+        engagement = post.likes
 
-        creator = await _creator_from_page(page)
-        engagement = await _engagement_from_page(page)
-        screenshot_data = await _screenshot_post(page)
+        # Download thumbnail image into memory
+        screenshot_data = _fetch_thumbnail(L, post)
 
         return PostCandidate(
-            source_url=post_url,
+            source_url=source_url,
             creator=creator,
             engagement=engagement,
             screenshot_data=screenshot_data,
             from_creator=from_creator,
         )
-    except SessionExpiredError:
-        raise
     except Exception as exc:
-        logger.debug("Failed to scrape Instagram post %s: %s", post_url, exc)
+        logger.debug("Skipping post due to error: %s", exc)
         return None
 
 
-async def _creator_from_page(page: Page) -> str:
-    """Try several selectors to extract the posting account handle."""
-    selectors = [
-        "article header a[role='link']",
-        "header a[role='link']",
-        "article header a",
-    ]
-    for sel in selectors:
-        try:
-            el = await page.query_selector(sel)
-            if el:
-                text = (await el.inner_text()).strip()
-                if text:
-                    return text
-        except Exception:
-            continue
-    return ""
-
-
-async def _engagement_from_page(page: Page) -> int:
-    """Return like count if visible, else 0."""
-    selectors = [
-        "button[type='button'] span",
-        "section span",
-    ]
-    for sel in selectors:
-        try:
-            els = await page.query_selector_all(sel)
-            for el in els:
-                text = (await el.inner_text()).strip().replace(",", "").replace(".", "")
-                if text.endswith(" likes"):
-                    num = text.replace(" likes", "").strip()
-                    if num.isdigit():
-                        return int(num)
-        except Exception:
-            continue
-    return 0
-
-
-async def _screenshot_post(page: Page) -> bytes:
-    """Screenshot the post image; fall back to viewport screenshot."""
-    img_selectors = [
-        "article div[role='presentation'] img",
-        "article img",
-        "main img",
-    ]
-    for sel in img_selectors:
-        try:
-            el = await page.query_selector(sel)
-            if el:
-                return await el.screenshot()
-        except Exception:
-            continue
+def _fetch_thumbnail(L: instaloader.Instaloader, post: instaloader.Post) -> bytes:
+    """Download the post thumbnail into memory and return raw bytes."""
     try:
-        return await page.screenshot(full_page=False)
+        url = post.url  # direct image/video thumbnail URL
+        with L.context.get_json(url, params={}) as _:
+            pass  # just a probe; use httpx below
     except Exception:
+        pass
+
+    # Use instaloader's underlying session to fetch the image bytes
+    try:
+        resp = L.context._session.get(post.url, timeout=10)
+        resp.raise_for_status()
+        return resp.content
+    except Exception as exc:
+        logger.debug("Could not fetch thumbnail for %s: %s", post.shortcode, exc)
         return b""

@@ -20,6 +20,9 @@ PLATFORM_CONFIG: dict[str, dict[str, str]] = {
     "instagram": {
         "session_file": str(SESSIONS_DIR / "instagram.json"),
         "login_url": "https://www.instagram.com/accounts/login/",
+        # Instagram lands on https://www.instagram.com/ after login,
+        # but the path must be exactly "/" or start with something other than
+        # /accounts/ or /challenge/ to be considered truly logged in.
         "logged_in_url_pattern": "https://www.instagram.com/",
         "logged_in_exclude": "/accounts/",
     },
@@ -57,16 +60,42 @@ async def create_session(platform: str) -> None:
         # For Instagram: URL is instagram.com but not /accounts/...
         # For Xiaohongshu: URL is xiaohongshu.com but not /login...
         exclude = config["logged_in_exclude"]
+        logged_in_pattern = config["logged_in_url_pattern"]
 
+        # For Instagram, wait for the actual home feed to be visible rather than
+        # just checking the URL — Instagram has several intermediate pages
+        # (/challenge/, "Save login info?", etc.) that briefly show instagram.com/
+        # before redirecting back to /accounts/. We wait for a stable logged-in
+        # state by polling every 2 seconds and requiring the URL to stay clean
+        # for at least 5 consecutive seconds.
         try:
-            await page.wait_for_function(
-                f"""() => {{
-                    const url = window.location.href;
-                    return url.includes('{config["logged_in_url_pattern"]}')
-                        && !url.includes('{exclude}');
-                }}""",
-                timeout=300_000,  # 5 minutes
-            )
+            stable_count = 0
+            deadline = 300  # 5 minutes total
+            elapsed = 0
+            while elapsed < deadline:
+                await asyncio.sleep(2)
+                elapsed += 2
+                current_url = page.url
+                is_clean = (
+                    logged_in_pattern in current_url
+                    and exclude not in current_url
+                    and "/challenge/" not in current_url
+                    and "/two_factor" not in current_url
+                )
+                if is_clean:
+                    stable_count += 1
+                else:
+                    stable_count = 0
+                # Require URL to be clean for 3 consecutive checks (6 seconds)
+                if stable_count >= 3:
+                    break
+            else:
+                await browser.close()
+                raise TimeoutError(
+                    f"Login timed out after 5 minutes for {platform}. Please try again."
+                )
+        except TimeoutError:
+            raise
         except Exception:
             await browser.close()
             raise TimeoutError(

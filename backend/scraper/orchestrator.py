@@ -40,7 +40,7 @@ from backend.db.models import (
 )
 from backend.scraper.browser import PLATFORM_CONFIG
 from backend.scraper.errors import PostCandidate, SessionExpiredError
-from backend.scraper.instagram import scrape_instagram
+from backend.scraper.instagram import scrape_instagram as _scrape_instagram_sync
 from backend.scraper.xiaohongshu import scrape_xiaohongshu
 
 logger = logging.getLogger(__name__)
@@ -74,15 +74,19 @@ async def run_scrape() -> None:
     ig_candidates: list[PostCandidate] = []
     try:
         logger.info("Starting Instagram scrape (keyword=%r, handles=%s)", ig_keyword, ig_handles)
-        results = await scrape_instagram(
-            keyword=ig_keyword,
-            creator_handles=ig_handles,
+        # instaloader is synchronous — run in a thread executor
+        results = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: _scrape_instagram_sync(
+                keyword=ig_keyword,
+                creator_handles=ig_handles,
+            ),
         )
         ig_candidates = results[:_PER_PLATFORM]
         logger.info("Instagram returned %d candidates.", len(ig_candidates))
     except SessionExpiredError:
         logger.warning("Instagram session expired — marking for re-auth.")
-        _invalidate_session("instagram")
+        _invalidate_instagram_session()
     except FileNotFoundError:
         logger.warning("No Instagram session — skipping platform.")
     except Exception as exc:
@@ -101,6 +105,7 @@ async def run_scrape() -> None:
     except SessionExpiredError:
         logger.warning("Xiaohongshu session expired — marking for re-auth.")
         _invalidate_session("xiaohongshu")
+
     except FileNotFoundError:
         logger.warning("No Xiaohongshu session — skipping platform.")
     except Exception as exc:
@@ -225,8 +230,18 @@ def _persist_results(
         )
 
 
+def _invalidate_instagram_session() -> None:
+    """Delete the instaloader session so auth status shows 'not authenticated'."""
+    from backend.scraper.instagram_loader import delete_session
+    try:
+        delete_session()
+        logger.info("Deleted Instagram (instaloader) session.")
+    except Exception as exc:
+        logger.warning("Could not delete Instagram session: %s", exc)
+
+
 def _invalidate_session(platform: str) -> None:
-    """Delete the saved session file so auth status shows 'not authenticated'."""
+    """Delete the saved Playwright session file (used for Xiaohongshu)."""
     session_file = Path(PLATFORM_CONFIG[platform]["session_file"])
     try:
         session_file.unlink(missing_ok=True)

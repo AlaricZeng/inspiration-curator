@@ -46,8 +46,10 @@ logger = logging.getLogger(__name__)
 
 STAGING_DIR = Path(__file__).parents[2] / "staging"
 
-# Maximum candidates returned by each scraper; 5 per platform = 10 total
+# Maximum candidates saved per platform per run; 5 per platform = 10 total
 _PER_PLATFORM = 5
+# How many extra candidates to fetch to account for duplicates seen in prior runs
+_FETCH_MULTIPLIER = 4
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +75,10 @@ async def run_scrape(force: bool = False) -> None:
 
     ig_keyword, ig_handles, xhs_keyword, xhs_handles, mode = _resolve_scrape_params(today)
 
+    # Pre-load already-seen URLs so scrapers can avoid them
+    seen_urls = _get_seen_urls()
+    fetch_limit = _PER_PLATFORM * _FETCH_MULTIPLIER
+
     # --- Instagram ---
     ig_candidates: list[PostCandidate] = []
     try:
@@ -80,9 +86,10 @@ async def run_scrape(force: bool = False) -> None:
         results = await _scrape_instagram(
             keyword=ig_keyword,
             creator_handles=ig_handles,
+            max_results=fetch_limit,
         )
-        ig_candidates = results[:_PER_PLATFORM]
-        logger.info("Instagram returned %d candidates.", len(ig_candidates))
+        ig_candidates = [c for c in results if c.source_url not in seen_urls][:_PER_PLATFORM]
+        logger.info("Instagram returned %d candidates (%d after dedup).", len(results), len(ig_candidates))
     except SessionExpiredError:
         logger.warning("Instagram session expired — marking for re-auth.")
         _invalidate_instagram_session()
@@ -98,9 +105,10 @@ async def run_scrape(force: bool = False) -> None:
         results = await scrape_xiaohongshu(
             keyword=xhs_keyword,
             creator_handles=xhs_handles,
+            max_results=fetch_limit,
         )
-        xhs_candidates = results[:_PER_PLATFORM]
-        logger.info("Xiaohongshu returned %d candidates.", len(xhs_candidates))
+        xhs_candidates = [c for c in results if c.source_url not in seen_urls][:_PER_PLATFORM]
+        logger.info("Xiaohongshu returned %d candidates (%d after dedup).", len(results), len(xhs_candidates))
     except SessionExpiredError:
         logger.warning("Xiaohongshu session expired — marking for re-auth.")
         _invalidate_session("xiaohongshu")
@@ -123,6 +131,12 @@ async def run_scrape(force: bool = False) -> None:
 # ---------------------------------------------------------------------------
 # DB helpers
 # ---------------------------------------------------------------------------
+
+
+def _get_seen_urls() -> set[str]:
+    """Return the set of all source_urls already persisted in the DB."""
+    with Session(engine) as session:
+        return set(session.exec(select(Post.source_url)).all())
 
 
 def _init_daily_run(today: dt.date, force: bool = False) -> str | None:
@@ -196,7 +210,17 @@ def _persist_results(
     mode: RunMode,
 ) -> None:
     with Session(engine) as session:
+        # Collect all source_urls already stored so we don't show duplicates
+        existing_urls: set[str] = set(
+            session.exec(select(Post.source_url)).all()
+        )
+
+        new_count = 0
         for platform, candidate in results:
+            if candidate.source_url in existing_urls:
+                logger.debug("Skipping already-seen post: %s", candidate.source_url)
+                continue
+
             screenshot_path: str | None = None
             if candidate.screenshot_data:
                 # Detect actual format: JPEG starts with FF D8, PNG with 89 50 4E 47
@@ -218,6 +242,8 @@ def _persist_results(
                 status=PostStatus.pending,
             )
             session.add(post)
+            existing_urls.add(candidate.source_url)
+            new_count += 1
 
         # Update DailyRun
         daily_run = session.get(DailyRun, run_id)
@@ -228,9 +254,10 @@ def _persist_results(
 
         session.commit()
         logger.info(
-            "Persisted %d posts for run %s (status=%s).",
-            len(results),
+            "Persisted %d new posts for run %s (%d dupes skipped, status=%s).",
+            new_count,
             run_id,
+            len(results) - new_count,
             RunStatus.done if results else RunStatus.failed,
         )
 

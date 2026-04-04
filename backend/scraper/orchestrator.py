@@ -32,6 +32,8 @@ from backend.db.models import (
     Creator,
     DailyRun,
     Platform,
+    PlatformRun,
+    PlatformStatus,
     Post,
     PostStatus,
     RunMode,
@@ -78,6 +80,10 @@ async def run_scrape(force: bool = False) -> None:
 
     ig_keyword, ig_handles, xhs_keyword, xhs_handles, mode = _resolve_scrape_params(today)
 
+    # Create PlatformRun records so the UI can track per-platform progress
+    ig_run_id = _init_platform_run(run_id, Platform.instagram)
+    xhs_run_id = _init_platform_run(run_id, Platform.xiaohongshu)
+
     # Pre-load already-seen URLs so scrapers can avoid them
     seen_urls = _get_seen_urls()
 
@@ -85,8 +91,6 @@ async def run_scrape(force: bool = False) -> None:
     ig_candidates: list[PostCandidate] = []
     try:
         logger.info("Starting Instagram scrape (keyword=%r, handles=%s)", ig_keyword, ig_handles)
-        # Pass seen_urls so the scraper skips dupes during collection and
-        # falls back to recent posts if top posts don't fill the quota.
         results = await _scrape_instagram(
             keyword=ig_keyword,
             creator_handles=ig_handles,
@@ -103,38 +107,38 @@ async def run_scrape(force: bool = False) -> None:
     except Exception as exc:
         logger.error("Instagram scrape failed: %s", exc, exc_info=True)
 
+    # Persist Instagram results immediately so the user can curate without waiting for Red
+    ig_count = _persist_platform_results(run_id, Platform.instagram, ig_candidates, staging_dir)
+    _finish_platform_run(ig_run_id, ig_count, skipped=not ig_candidates)
+
+    # Refresh seen_urls to include the Instagram posts we just saved
+    seen_urls = _get_seen_urls()
+
     # --- Xiaohongshu ---
     xhs_candidates: list[PostCandidate] = []
     try:
         logger.info("Starting Xiaohongshu scrape (keyword=%r, handles=%s)", xhs_keyword, xhs_handles)
-        # Pass seen_urls so the scraper scrolls deeper when needed to find
-        # exactly _PER_PLATFORM fresh posts, rather than silently returning fewer.
         results = await scrape_xiaohongshu(
             keyword=xhs_keyword,
             creator_handles=xhs_handles,
             max_results=_PER_PLATFORM,
             skip_urls=seen_urls,
         )
-        # Results are already deduplicated by the scraper; no extra filter needed.
         xhs_candidates = _weighted_sample(results, _PER_PLATFORM)
         logger.info("Xiaohongshu returned %d fresh candidates (%d sampled).", len(results), len(xhs_candidates))
     except SessionExpiredError:
         logger.warning("Xiaohongshu session expired — marking for re-auth.")
         _invalidate_session("xiaohongshu")
-
     except FileNotFoundError:
         logger.warning("No Xiaohongshu session — skipping platform.")
     except Exception as exc:
         logger.error("Xiaohongshu scrape failed: %s", exc, exc_info=True)
 
-    # --- Persist results ---
-    all_results: list[tuple[Platform, PostCandidate]] = [
-        (Platform.instagram, c) for c in ig_candidates
-    ] + [
-        (Platform.xiaohongshu, c) for c in xhs_candidates
-    ]
+    xhs_count = _persist_platform_results(run_id, Platform.xiaohongshu, xhs_candidates, staging_dir)
+    _finish_platform_run(xhs_run_id, xhs_count, skipped=not xhs_candidates)
 
-    _persist_results(run_id, all_results, staging_dir, mode)
+    # Mark overall run done/failed
+    _finish_daily_run(run_id, mode, ig_count + xhs_count)
 
 
 # ---------------------------------------------------------------------------
@@ -247,27 +251,46 @@ def _resolve_scrape_params(
         return keyword, ig_handles, keyword, xhs_handles, RunMode.vibe
 
 
-def _persist_results(
-    run_id: str,
-    results: list[tuple[Platform, PostCandidate]],
-    staging_dir: Path,
-    mode: RunMode,
-) -> None:
+def _init_platform_run(run_id: str, platform: Platform) -> str:
+    """Create a PlatformRun row for *platform* in *running* state and return its id."""
     with Session(engine) as session:
-        # Collect all source_urls already stored so we don't show duplicates
-        existing_urls: set[str] = set(
-            session.exec(select(Post.source_url)).all()
-        )
+        pr = PlatformRun(run_id=run_id, platform=platform, status=PlatformStatus.running)
+        session.add(pr)
+        session.commit()
+        session.refresh(pr)
+        return pr.id
+
+
+def _finish_platform_run(platform_run_id: str, post_count: int, *, skipped: bool) -> None:
+    """Mark a PlatformRun as done (or skipped) and record how many posts were saved."""
+    with Session(engine) as session:
+        pr = session.get(PlatformRun, platform_run_id)
+        if pr is None:
+            return
+        pr.status = PlatformStatus.skipped if skipped else PlatformStatus.done
+        pr.post_count = post_count
+        session.add(pr)
+        session.commit()
+
+
+def _persist_platform_results(
+    run_id: str,
+    platform: Platform,
+    candidates: list[PostCandidate],
+    staging_dir: Path,
+) -> int:
+    """Write *candidates* for one platform to DB. Returns count of new posts saved."""
+    with Session(engine) as session:
+        existing_urls: set[str] = set(session.exec(select(Post.source_url)).all())
 
         new_count = 0
-        for platform, candidate in results:
+        for candidate in candidates:
             if candidate.source_url in existing_urls:
                 logger.debug("Skipping already-seen post: %s", candidate.source_url)
                 continue
 
             screenshot_path: str | None = None
             if candidate.screenshot_data:
-                # Detect actual format: JPEG starts with FF D8, PNG with 89 50 4E 47
                 ext = "jpg" if candidate.screenshot_data[:2] == b"\xff\xd8" else "png"
                 filename = f"{platform.value}_{uuid.uuid4().hex[:8]}.{ext}"
                 screenshot_file = staging_dir / filename
@@ -293,20 +316,24 @@ def _persist_results(
             existing_urls.add(candidate.source_url)
             new_count += 1
 
-        # Update DailyRun
+        session.commit()
+        logger.info("Persisted %d new %s posts for run %s.", new_count, platform.value, run_id)
+        return new_count
+
+
+def _finish_daily_run(run_id: str, mode: RunMode, total_posts: int) -> None:
+    with Session(engine) as session:
         daily_run = session.get(DailyRun, run_id)
         if daily_run is not None:
             daily_run.mode = mode
-            daily_run.status = RunStatus.done if results else RunStatus.failed
+            daily_run.status = RunStatus.done if total_posts > 0 else RunStatus.failed
             session.add(daily_run)
-
-        session.commit()
+            session.commit()
         logger.info(
-            "Persisted %d new posts for run %s (%d dupes skipped, status=%s).",
-            new_count,
+            "Daily run %s finished — %d total posts, status=%s.",
             run_id,
-            len(results) - new_count,
-            RunStatus.done if results else RunStatus.failed,
+            total_posts,
+            RunStatus.done if total_posts > 0 else RunStatus.failed,
         )
 
 

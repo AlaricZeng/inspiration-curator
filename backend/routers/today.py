@@ -20,6 +20,8 @@ from sqlmodel import Session, select
 from backend.curator.storage import INSPIRATION_DIR
 from backend.db.models import (
     DailyRun,
+    Platform,
+    PlatformRun,
     Post,
     PostStatus,
     RunMode,
@@ -46,12 +48,19 @@ class PostOut(BaseModel):
     status: str
 
 
+class PlatformProgress(BaseModel):
+    status: str  # pending | running | done | skipped
+    post_count: int
+
+
 class TodayResponse(BaseModel):
     date: str
     status: str
     keyword: Optional[str]
     pending_count: int
     posts: list[PostOut]
+    instagram: Optional[PlatformProgress] = None
+    xiaohongshu: Optional[PlatformProgress] = None
 
 
 class KeywordBody(BaseModel):
@@ -116,6 +125,19 @@ async def get_today() -> TodayResponse:
         posts = _posts_for_today(session, today) if run is not None else []
         pending_count = sum(1 for p in posts if p.status == PostStatus.pending)
 
+        ig_progress: Optional[PlatformProgress] = None
+        xhs_progress: Optional[PlatformProgress] = None
+        if run is not None:
+            platform_runs = session.exec(
+                select(PlatformRun).where(PlatformRun.run_id == run.id)
+            ).all()
+            for pr in platform_runs:
+                prog = PlatformProgress(status=pr.status.value, post_count=pr.post_count)
+                if pr.platform == Platform.instagram:
+                    ig_progress = prog
+                else:
+                    xhs_progress = prog
+
         return TodayResponse(
             date=today.isoformat(),
             status=run.status.value if run else RunStatus.pending.value,
@@ -132,6 +154,8 @@ async def get_today() -> TodayResponse:
                 )
                 for p in posts
             ],
+            instagram=ig_progress,
+            xiaohongshu=xhs_progress,
         )
 
 

@@ -11,11 +11,18 @@ const PRESETS = [
   "Fashion",
 ] as const;
 
+interface PlatformProgress {
+  status: "pending" | "running" | "done" | "skipped";
+  post_count: number;
+}
+
 interface TodayData {
   date: string;
   status: "pending" | "running" | "done" | "failed";
   keyword: string | null;
   pending_count: number;
+  instagram: PlatformProgress | null;
+  xiaohongshu: PlatformProgress | null;
 }
 
 export default function Today() {
@@ -132,6 +139,9 @@ export default function Today() {
 
   const isRunning = data?.status === "running" || launching;
   const canCurate = data?.status === "done" && (data?.pending_count ?? 0) > 0;
+  const igDone = data?.instagram?.status === "done" && (data.instagram.post_count ?? 0) > 0;
+  const xhsDone = data?.xiaohongshu?.status === "done" && (data.xiaohongshu.post_count ?? 0) > 0;
+  const showEarlyCurate = isRunning && (igDone || xhsDone);
 
   return (
     <div style={s.page}>
@@ -152,7 +162,7 @@ export default function Today() {
             </div>
           )}
 
-          {isRunning && <RunProgress />}
+          {isRunning && <RunProgress instagram={data?.instagram ?? null} xiaohongshu={data?.xiaohongshu ?? null} />}
 
           {seedNeeded && (
             <div style={s.seedBox}>
@@ -206,6 +216,12 @@ export default function Today() {
               {isRunning ? "Running…" : "Run Now"}
             </button>
 
+            {showEarlyCurate && (
+              <Link to="/curate" style={{ ...s.btn, ...s.btnAccent, textDecoration: "none" }}>
+                Curate now — {(data!.instagram?.post_count ?? 0) + (data!.xiaohongshu?.post_count ?? 0)} posts ready
+              </Link>
+            )}
+
             {canCurate && (
               <Link to="/curate" style={{ ...s.btn, ...s.btnAccent, textDecoration: "none" }}>
                 Start Curation — {data!.pending_count} posts
@@ -218,7 +234,36 @@ export default function Today() {
   );
 }
 
-function RunProgress() {
+function PlatformBar({ label, progress }: { label: string; progress: PlatformProgress | null }) {
+  const isDone = progress?.status === "done";
+  const isSkipped = progress?.status === "skipped";
+  const isRunning = progress?.status === "running" || progress == null;
+
+  let statusText = "waiting…";
+  if (isDone) statusText = `${progress!.post_count} posts ready`;
+  else if (isSkipped) statusText = "skipped";
+  else if (isRunning) statusText = "fetching…";
+
+  return (
+    <div style={rp.platformRow}>
+      <div style={rp.platformLabel}>
+        <span style={rp.platformName}>{label}</span>
+        <span style={{ ...rp.platformStatus, color: isDone ? "#4caf50" : isSkipped ? "#555" : "#7986cb" }}>
+          {statusText}
+        </span>
+      </div>
+      <div style={rp.track}>
+        {isDone || isSkipped ? (
+          <div style={{ ...rp.bar, width: "100%", animation: "none", background: isDone ? "#4caf50" : "#2e2e2e", opacity: isDone ? 1 : 0.4 }} />
+        ) : (
+          <div style={rp.bar} />
+        )}
+      </div>
+    </div>
+  );
+}
+
+function RunProgress({ instagram, xiaohongshu }: { instagram: PlatformProgress | null; xiaohongshu: PlatformProgress | null }) {
   return (
     <div style={rp.wrap}>
       <style>{`
@@ -227,22 +272,23 @@ function RunProgress() {
           100% { transform: translateX(250%); }
         }
       `}</style>
-      <div style={rp.track}>
-        <div style={rp.bar} />
-      </div>
-      <p style={rp.label}>Scraping posts… this takes a minute</p>
+      <PlatformBar label="Instagram" progress={instagram} />
+      <PlatformBar label="Red (小红书)" progress={xiaohongshu} />
     </div>
   );
 }
 
 const rp: Record<string, CSSProperties> = {
-  wrap: { marginBottom: "1.5rem" },
+  wrap: { marginBottom: "1.5rem", display: "flex", flexDirection: "column", gap: "0.75rem" },
+  platformRow: { display: "flex", flexDirection: "column", gap: "0.3rem" },
+  platformLabel: { display: "flex", justifyContent: "space-between", alignItems: "baseline" },
+  platformName: { color: "#888", fontSize: "0.78rem", fontWeight: 600 },
+  platformStatus: { fontSize: "0.72rem" },
   track: {
     height: 4,
     background: "#1e1e1e",
     borderRadius: 999,
     overflow: "hidden",
-    marginBottom: "0.5rem",
   },
   bar: {
     height: "100%",
@@ -251,7 +297,6 @@ const rp: Record<string, CSSProperties> = {
     borderRadius: 999,
     animation: "shimmer 1.6s ease-in-out infinite",
   },
-  label: { color: "#555", fontSize: "0.75rem", margin: 0 },
 };
 
 function StatusChip({ status }: { status: string }) {

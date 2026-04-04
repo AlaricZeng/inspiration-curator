@@ -29,6 +29,13 @@ class RunStatus(str, Enum):
     failed = "failed"
 
 
+class PlatformStatus(str, Enum):
+    pending = "pending"
+    running = "running"
+    done = "done"
+    skipped = "skipped"
+
+
 class Post(SQLModel, table=True):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()), primary_key=True)
     platform: Platform
@@ -54,6 +61,14 @@ class VibeKeyword(SQLModel, table=True):
     last_seen: dt.datetime = Field(default_factory=dt.datetime.utcnow)
     user_pinned: bool = Field(default=False)
     user_blocked: bool = Field(default=False)
+
+
+class PlatformRun(SQLModel, table=True):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()), primary_key=True)
+    run_id: str = Field(foreign_key="dailyrun.id", index=True)
+    platform: Platform
+    status: PlatformStatus = Field(default=PlatformStatus.pending)
+    post_count: int = Field(default=0)
 
 
 class DailyRun(SQLModel, table=True):

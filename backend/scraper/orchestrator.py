@@ -108,7 +108,7 @@ async def run_scrape(force: bool = False) -> None:
         logger.error("Instagram scrape failed: %s", exc, exc_info=True)
 
     # Persist Instagram results immediately so the user can curate without waiting for Red
-    ig_count = _persist_platform_results(run_id, Platform.instagram, ig_candidates, staging_dir)
+    ig_count = _persist_platform_results(run_id, Platform.instagram, ig_candidates, staging_dir, keyword=ig_keyword)
     _finish_platform_run(ig_run_id, ig_count, skipped=not ig_candidates)
 
     # Refresh seen_urls to include the Instagram posts we just saved
@@ -134,7 +134,7 @@ async def run_scrape(force: bool = False) -> None:
     except Exception as exc:
         logger.error("Xiaohongshu scrape failed: %s", exc, exc_info=True)
 
-    xhs_count = _persist_platform_results(run_id, Platform.xiaohongshu, xhs_candidates, staging_dir)
+    xhs_count = _persist_platform_results(run_id, Platform.xiaohongshu, xhs_candidates, staging_dir, keyword=xhs_keyword)
     _finish_platform_run(xhs_run_id, xhs_count, skipped=not xhs_candidates)
 
     # Mark overall run done/failed
@@ -278,6 +278,7 @@ def _persist_platform_results(
     platform: Platform,
     candidates: list[PostCandidate],
     staging_dir: Path,
+    keyword: str | None = None,
 ) -> int:
     """Write *candidates* for one platform to DB. Returns count of new posts saved."""
     with Session(engine) as session:
@@ -311,6 +312,7 @@ def _persist_platform_results(
                 screenshot=screenshot_path,
                 engagement=candidate.engagement,
                 status=PostStatus.pending,
+                keyword=keyword,
             )
             session.add(post)
             existing_urls.add(candidate.source_url)

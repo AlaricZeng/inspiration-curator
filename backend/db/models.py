@@ -45,6 +45,7 @@ class Post(SQLModel, table=True):
     scraped_at: dt.datetime = Field(default_factory=dt.datetime.now)
     status: PostStatus = Field(default=PostStatus.pending)
     engagement: int = Field(default=0)
+    keyword: Optional[str] = None
 
 
 class Creator(SQLModel, table=True):

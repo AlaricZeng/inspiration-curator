@@ -64,7 +64,7 @@ class TodayResponse(BaseModel):
 
 
 class KeywordBody(BaseModel):
-    keyword: str
+    keyword: str = ""
 
 
 class KeywordResponse(BaseModel):
@@ -166,17 +166,18 @@ async def set_today_keyword(body: KeywordBody) -> KeywordResponse:
         run = session.exec(
             select(DailyRun).where(DailyRun.run_date == today)
         ).first()
+        kw = body.keyword.strip() or None
         if run is None:
             run = DailyRun(
                 run_date=today,
                 status=RunStatus.pending,
-                mode=RunMode.keyword,
-                keyword=body.keyword,
+                mode=RunMode.keyword if kw else RunMode.vibe,
+                keyword=kw,
             )
             session.add(run)
         else:
-            run.keyword = body.keyword
-            run.mode = RunMode.keyword
+            run.keyword = kw
+            run.mode = RunMode.keyword if kw else RunMode.vibe
             session.add(run)
         session.commit()
     return KeywordResponse(keyword=body.keyword)

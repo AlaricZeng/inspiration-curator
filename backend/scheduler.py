@@ -23,7 +23,7 @@ async def _daily_scrape() -> None:
 
     logger.info("Daily scrape triggered by scheduler.")
     try:
-        await run_scrape()
+        await run_scrape(force=True)
     except Exception:
         logger.exception("Unhandled error in daily scrape job.")
 

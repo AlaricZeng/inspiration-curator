@@ -27,6 +27,9 @@ class GalleryPostOut(BaseModel):
     creator: str
     engagement: int
     screenshot_url: Optional[str]
+    date: str
+    keyword: Optional[str]
+    run_mode: str  # "keyword" | "vibe"
 
 
 class GalleryDay(BaseModel):
@@ -58,6 +61,9 @@ async def get_gallery() -> list[GalleryDay]:
                 creator=post.creator,
                 engagement=post.engagement,
                 screenshot_url=_screenshot_url(post.screenshot),
+                date=date_str,
+                keyword=post.keyword,
+                run_mode="keyword" if post.keyword else "vibe",
             )
         )
 

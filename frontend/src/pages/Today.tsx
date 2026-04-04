@@ -87,7 +87,6 @@ export default function Today() {
 
   const handleKeyword = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!keyword.trim()) return;
     setSaving(true);
     setError(null);
     try {
@@ -195,14 +194,8 @@ export default function Today() {
                 placeholder="e.g. moody architecture"
                 value={keyword}
                 onChange={(e) => setKeyword(e.target.value)}
+                onBlur={(e) => void handleKeyword(e as unknown as React.FormEvent)}
               />
-              <button
-                type="submit"
-                style={{ ...s.btn, ...(saving || !keyword.trim() ? s.btnDisabled : {}) }}
-                disabled={saving || !keyword.trim()}
-              >
-                {saving ? "Saving…" : "Set"}
-              </button>
             </div>
             <p style={s.hint}>Leave blank to use your taste profile. Resets at midnight.</p>
           </form>
@@ -399,11 +392,11 @@ const s: Record<string, CSSProperties> = {
     marginBottom: "1.25rem",
   },
   statusRow: {
-    display: "flex",
+    display: "inline-flex",
     alignItems: "center",
-    justifyContent: "space-between",
+    gap: "0.75rem",
     marginBottom: "1.5rem",
-    padding: "0.75rem 1rem",
+    padding: "0.4rem 0.85rem",
     background: "#111",
     borderRadius: 8,
     border: "1px solid #222",

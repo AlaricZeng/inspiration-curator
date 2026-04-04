@@ -8,6 +8,9 @@ interface GalleryPost {
   creator: string;
   engagement: number;
   screenshot_url: string | null;
+  date: string;
+  keyword: string | null;
+  run_mode: string;
 }
 
 interface GalleryDay {
@@ -15,12 +18,48 @@ interface GalleryDay {
   posts: GalleryPost[];
 }
 
+type GroupBy = "date" | "keyword" | "vibe";
+
 export default function Gallery() {
   const [days, setDays] = useState<GalleryDay[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [modal, setModal] = useState<GalleryPost | null>(null);
+  const [modalIdx, setModalIdx] = useState<number | null>(null);
   const [deleting, setDeleting] = useState(false);
+  const [groupBy, setGroupBy] = useState<GroupBy>("date");
+
+  const allPosts = days.flatMap((d) => d.posts);
+
+  const groups: { label: string; posts: GalleryPost[] }[] = (() => {
+    const map = new Map<string, GalleryPost[]>();
+    for (const post of allPosts) {
+      let key: string;
+      if (groupBy === "keyword") {
+        key = post.run_mode === "keyword" && post.keyword ? post.keyword.toLowerCase() : "";
+      } else if (groupBy === "vibe") {
+        key = post.run_mode === "vibe" ? "" : (post.keyword?.toLowerCase() ?? "");
+      } else {
+        key = post.date;
+      }
+      if (!map.has(key)) map.set(key, []);
+      map.get(key)!.push(post);
+    }
+    // Sort: named groups alphabetically, unlabelled last
+    const entries = Array.from(map.entries()).sort(([a], [b]) => {
+      if (a === "" && b !== "") return 1;
+      if (a !== "" && b === "") return -1;
+      return a.localeCompare(b);
+    });
+    return entries.map(([key, posts]) => ({
+      label: groupBy === "date" ? key : (key === "" ? "null" : (posts[0]?.keyword ?? key)),
+      posts,
+    }));
+  })();
+  const modal = modalIdx !== null ? (allPosts[modalIdx] ?? null) : null;
+
+  const openModal = (post: GalleryPost) => setModalIdx(allPosts.findIndex((p) => p.id === post.id));
+  const prev = () => setModalIdx((i) => (i !== null && i > 0 ? i - 1 : i));
+  const next = () => setModalIdx((i) => (i !== null && i < allPosts.length - 1 ? i + 1 : i));
 
   useEffect(() => {
     async function load() {
@@ -37,10 +76,12 @@ export default function Gallery() {
     void load();
   }, []);
 
-  // Close modal on Escape
+  // Keyboard navigation
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setModal(null);
+      if (e.key === "Escape") setModalIdx(null);
+      if (e.key === "ArrowLeft") prev();
+      if (e.key === "ArrowRight") next();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -57,7 +98,7 @@ export default function Gallery() {
           .map((day) => ({ ...day, posts: day.posts.filter((p) => p.id !== post.id) }))
           .filter((day) => day.posts.length > 0)
       );
-      setModal(null);
+      setModalIdx(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Unknown error");
     } finally {
@@ -73,9 +114,20 @@ export default function Gallery() {
       <main style={s.main}>
         <div style={s.pageHeader}>
           <h1 style={s.title}>Gallery</h1>
-          {!loading && totalPosts > 0 && (
-            <span style={s.count}>{totalPosts} saved</span>
-          )}
+          <div style={s.pageHeaderRight}>
+            {!loading && totalPosts > 0 && (
+              <span style={s.count}>{totalPosts} saved</span>
+            )}
+            {(["date", "keyword", "vibe"] as GroupBy[]).map((g) => (
+              <button
+                key={g}
+                style={{ ...s.groupBtn, ...(groupBy === g ? s.groupBtnActive : {}) }}
+                onClick={() => setGroupBy(g)}
+              >
+                {g === "date" ? "Date" : g === "keyword" ? "Keyword" : "Vibe"}
+              </button>
+            ))}
+          </div>
         </div>
 
         {error && <div style={s.error}>{error}</div>}
@@ -90,15 +142,15 @@ export default function Gallery() {
           </p>
         )}
 
-        {days.map((day) => (
-          <section key={day.date} style={s.section}>
-            <h2 style={s.dateHeader}>{day.date}</h2>
+        {groups.map((group) => (
+          <section key={group.label} style={s.section}>
+            <h2 style={s.dateHeader}>{group.label}</h2>
             <div style={s.grid}>
-              {day.posts.map((post) => (
+              {group.posts.map((post) => (
                 <button
                   key={post.id}
                   style={s.thumb}
-                  onClick={() => setModal(post)}
+                  onClick={() => openModal(post)}
                   title={`@${post.creator}`}
                 >
                   {post.screenshot_url ? (
@@ -117,19 +169,21 @@ export default function Gallery() {
         ))}
       </main>
 
-      {modal && (
-        <div style={s.overlay} onClick={() => setModal(null)}>
+      {modal && modalIdx !== null && (
+        <div style={s.overlay} onClick={() => setModalIdx(null)}>
           <div style={s.modalBox} onClick={(e) => e.stopPropagation()}>
-            <button style={s.closeBtn} onClick={() => setModal(null)} title="Close (Esc)">
-              ✕
-            </button>
+            <button style={s.closeBtn} onClick={() => setModalIdx(null)} title="Close (Esc)">✕</button>
+
+            {modalIdx > 0 && (
+              <button style={{ ...s.navBtn, left: "0.5rem" }} onClick={prev} title="Previous (←)">‹</button>
+            )}
+            {modalIdx < allPosts.length - 1 && (
+              <button style={{ ...s.navBtn, right: "0.5rem" }} onClick={next} title="Next (→)">›</button>
+            )}
+
             {modal.screenshot_url && (
               <div style={s.modalImgWrap}>
-                <img
-                  src={modal.screenshot_url}
-                  alt={`@${modal.creator}`}
-                  style={s.modalImg}
-                />
+                <img src={modal.screenshot_url} alt={`@${modal.creator}`} style={s.modalImg} />
               </div>
             )}
             <div style={s.modalMeta}>
@@ -138,6 +192,7 @@ export default function Gallery() {
               <span style={s.modalEngagement}>
                 {modal.engagement.toLocaleString()} engagements
               </span>
+              <span style={s.modalCounter}>{modalIdx + 1} / {allPosts.length}</span>
               <button
                 style={{ ...s.deleteBtn, ...(deleting ? s.deleteBtnDisabled : {}) }}
                 onClick={() => void handleDelete(modal)}
@@ -181,12 +236,24 @@ const s: Record<string, CSSProperties> = {
   main: { flex: 1, padding: "2.5rem 2rem", maxWidth: 1200, margin: "0 auto", width: "100%" },
   pageHeader: {
     display: "flex",
-    alignItems: "baseline",
+    alignItems: "center",
     justifyContent: "space-between",
     marginBottom: "2.5rem",
   },
+  pageHeaderRight: { display: "flex", alignItems: "center", gap: "0.5rem" },
   title: { margin: 0, fontSize: "1.5rem", fontWeight: 600, letterSpacing: "-0.02em" },
-  count: { color: "#555", fontSize: "0.85rem" },
+  count: { color: "#555", fontSize: "0.85rem", marginRight: "0.5rem" },
+  groupBtn: {
+    background: "#1a1a1a",
+    border: "1px solid #2a2a2a",
+    color: "#666",
+    borderRadius: 6,
+    padding: "0.3rem 0.7rem",
+    fontSize: "0.78rem",
+    cursor: "pointer",
+    fontWeight: 500,
+  },
+  groupBtnActive: { background: "#252525", border: "1px solid #444", color: "#e8e8e8" },
   error: {
     background: "#2a1010",
     border: "1px solid #5c1a1a",
@@ -291,6 +358,25 @@ const s: Record<string, CSSProperties> = {
   },
   modalCreator: { color: "#ccc", fontSize: "0.9rem", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" },
   modalEngagement: { color: "#555", fontSize: "0.8rem", marginLeft: "auto", whiteSpace: "nowrap" },
+  navBtn: {
+    position: "absolute",
+    top: "50%",
+    transform: "translateY(-50%)",
+    background: "rgba(0,0,0,0.6)",
+    border: "1px solid #333",
+    color: "#ccc",
+    borderRadius: "50%",
+    width: 44,
+    height: 44,
+    fontSize: "1.5rem",
+    cursor: "pointer",
+    zIndex: 2,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    lineHeight: 1,
+  },
+  modalCounter: { color: "#444", fontSize: "0.75rem", whiteSpace: "nowrap" as const },
   deleteBtn: {
     background: "transparent",
     border: "1px solid #3a1a1a",

@@ -107,8 +107,11 @@ async def run_scrape(force: bool = False) -> None:
     except Exception as exc:
         logger.error("Instagram scrape failed: %s", exc, exc_info=True)
 
+    # In vibe mode, don't store the vibe keyword on posts (it's a search hint, not a user keyword)
+    persist_keyword = ig_keyword if mode == RunMode.keyword else None
+
     # Persist Instagram results immediately so the user can curate without waiting for Red
-    ig_count = _persist_platform_results(run_id, Platform.instagram, ig_candidates, staging_dir, keyword=ig_keyword)
+    ig_count = _persist_platform_results(run_id, Platform.instagram, ig_candidates, staging_dir, keyword=persist_keyword)
     _finish_platform_run(ig_run_id, ig_count, skipped=not ig_candidates)
 
     # Refresh seen_urls to include the Instagram posts we just saved
@@ -134,7 +137,7 @@ async def run_scrape(force: bool = False) -> None:
     except Exception as exc:
         logger.error("Xiaohongshu scrape failed: %s", exc, exc_info=True)
 
-    xhs_count = _persist_platform_results(run_id, Platform.xiaohongshu, xhs_candidates, staging_dir, keyword=xhs_keyword)
+    xhs_count = _persist_platform_results(run_id, Platform.xiaohongshu, xhs_candidates, staging_dir, keyword=persist_keyword)
     _finish_platform_run(xhs_run_id, xhs_count, skipped=not xhs_candidates)
 
     # Mark overall run done/failed
@@ -235,14 +238,15 @@ def _resolve_scrape_params(
             kw = daily_run.keyword
             return kw, [], kw, [], RunMode.keyword
 
-        # Vibe mode: top-3 non-blocked VibeKeywords — pinned first, then by frequency
+        # Vibe mode: pick randomly from top-5 non-blocked VibeKeywords (pinned first, then by frequency)
         vibe_kws = session.exec(
             select(VibeKeyword)
             .where(VibeKeyword.user_blocked == False)  # noqa: E712
             .order_by(VibeKeyword.user_pinned.desc(), VibeKeyword.frequency.desc())
-            .limit(3)
+            .limit(5)
         ).all()
-        keyword = vibe_kws[0].keyword if vibe_kws else None
+        keyword = random.choice(vibe_kws).keyword if vibe_kws else None
+        logger.info("Vibe mode: selected keyword %r from top-%d candidates.", keyword, len(vibe_kws))
 
         creators = session.exec(select(Creator)).all()
         ig_handles = [c.handle for c in creators if c.platform == Platform.instagram]

@@ -258,14 +258,17 @@ export default function Gallery() {
             <>
               {/* Platform tabs */}
               <div style={s.platformTabs}>
-                {(["instagram", "xiaohongshu"] as const).map((p) => (
-                  <button
-                    key={p}
-                    style={{ ...s.platformTab, ...(tagPlatform === p ? s.platformTabActive : {}) }}
-                    onClick={() => { setTagPlatform(p); setSelectedKeywords(new Set()); setModalIdx(null); }}
-                  >
-                    {p === "instagram" ? "Instagram" : "小红书"}
-                  </button>
+                {(["instagram", "xiaohongshu"] as const).map((p, i) => (
+                  <>
+                    {i > 0 && <span key={`sep-${p}`} style={s.platformTabSep}>/</span>}
+                    <button
+                      key={p}
+                      style={{ ...s.platformTab, ...(tagPlatform === p ? s.platformTabActive : {}) }}
+                      onClick={() => { setTagPlatform(p); setSelectedKeywords(new Set()); setModalIdx(null); }}
+                    >
+                      {p === "instagram" ? "Instagram" : "小红书"}
+                    </button>
+                  </>
                 ))}
               </div>
 
@@ -626,23 +629,31 @@ const s: Record<string, CSSProperties> = {
   },
   platformTabs: {
     display: "flex",
-    gap: "0.35rem",
+    gap: "1.5rem",
     marginBottom: "1.25rem",
+    borderBottom: "1px solid #1e1e1e",
   },
   platformTab: {
-    background: "#1a1a1a",
-    border: "1px solid #2a2a2a",
-    color: "#555",
-    borderRadius: 6,
-    padding: "0.3rem 0.85rem",
-    fontSize: "0.8rem",
+    background: "transparent",
+    border: "none",
+    borderBottom: "2px solid transparent",
+    color: "#444",
+    padding: "0.3rem 0",
+    marginBottom: "-1px",
+    fontSize: "0.88rem",
     cursor: "pointer",
     fontWeight: 500,
+    letterSpacing: "0.01em",
   },
   platformTabActive: {
-    background: "#252525",
-    border: "1px solid #444",
     color: "#e8e8e8",
+    borderBottom: "2px solid #e8e8e8",
+  },
+  platformTabSep: {
+    color: "#2a2a2a",
+    fontSize: "0.88rem",
+    alignSelf: "center",
+    userSelect: "none",
   },
   modalTagChip: {
     background: "#111",

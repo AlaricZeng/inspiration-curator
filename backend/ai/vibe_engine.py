@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import datetime
 import logging
@@ -50,6 +51,24 @@ async def _call_openai(image_path: str) -> str:
         max_tokens=100,
     )
     return response.choices[0].message.content or ""
+
+
+async def _call_gemini(image_path: str) -> str:
+    from google import genai  # type: ignore
+    from google.genai import types  # type: ignore
+
+    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    img_bytes = Path(image_path).read_bytes()
+    ext = "jpeg" if img_bytes[:2] == b"\xff\xd8" else "png"
+    response = await asyncio.to_thread(
+        client.models.generate_content,
+        model="gemini-2.5-flash",
+        contents=[
+            types.Part.from_bytes(data=img_bytes, mime_type=f"image/{ext}"),
+            VIBE_PROMPT,
+        ],
+    )
+    return response.text or ""
 
 
 async def _call_anthropic(image_path: str) -> str:
@@ -146,6 +165,8 @@ async def analyze_vibe(post_id: str) -> None:
     try:
         if provider == "anthropic":
             raw = await _call_anthropic(screenshot)
+        elif provider == "gemini":
+            raw = await _call_gemini(screenshot)
         else:
             raw = await _call_openai(screenshot)
     except Exception as exc:
@@ -160,3 +181,10 @@ async def analyze_vibe(post_id: str) -> None:
     logger.info("analyze_vibe: post %s → %s", post_id, keywords)
     _upsert_keywords(keywords)
     _upsert_creator(platform, handle)
+
+    with Session(engine) as session:
+        post = session.get(Post, post_id)
+        if post is not None:
+            post.vibe_keywords = ", ".join(keywords)
+            session.add(post)
+            session.commit()

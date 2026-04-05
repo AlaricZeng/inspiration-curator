@@ -11,6 +11,7 @@ interface GalleryPost {
   date: string;
   keyword: string | null;
   run_mode: string;
+  vibe_keywords: string[] | null;
 }
 
 interface GalleryDay {
@@ -27,39 +28,69 @@ export default function Gallery() {
   const [modalIdx, setModalIdx] = useState<number | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [groupBy, setGroupBy] = useState<GroupBy>("date");
+  const [selectedKeywords, setSelectedKeywords] = useState<Set<string>>(new Set());
 
   const allPosts = days.flatMap((d) => d.posts);
 
+  // --- Vibe mode: keyword filter ---
+  const keywordFreq = new Map<string, number>();
+  for (const post of allPosts) {
+    for (const kw of post.vibe_keywords ?? []) {
+      keywordFreq.set(kw, (keywordFreq.get(kw) ?? 0) + 1);
+    }
+  }
+  const allVibeKeywords = Array.from(keywordFreq.entries())
+    .sort((a, b) => b[1] - a[1])
+    .map(([kw]) => kw);
+
+  const vibePosts =
+    selectedKeywords.size === 0
+      ? allPosts
+      : allPosts.filter((p) => p.vibe_keywords?.some((kw) => selectedKeywords.has(kw)));
+
+  const toggleKeyword = (kw: string) => {
+    setSelectedKeywords((prev) => {
+      const next = new Set(prev);
+      if (next.has(kw)) next.delete(kw);
+      else next.add(kw);
+      setModalIdx(null);
+      return next;
+    });
+  };
+
+  // --- Date / Keyword mode: grouped sections ---
   const groups: { label: string; posts: GalleryPost[] }[] = (() => {
+    if (groupBy === "vibe") return [];
     const map = new Map<string, GalleryPost[]>();
     for (const post of allPosts) {
-      let key: string;
-      if (groupBy === "keyword") {
-        key = post.run_mode === "keyword" && post.keyword ? post.keyword.toLowerCase() : "";
-      } else if (groupBy === "vibe") {
-        key = post.run_mode === "vibe" ? "" : (post.keyword?.toLowerCase() ?? "");
-      } else {
-        key = post.date;
-      }
+      const key =
+        groupBy === "keyword"
+          ? (post.run_mode === "keyword" && post.keyword ? post.keyword.toLowerCase() : "")
+          : post.date;
       if (!map.has(key)) map.set(key, []);
       map.get(key)!.push(post);
     }
-    // Sort: named groups alphabetically, unlabelled last
     const entries = Array.from(map.entries()).sort(([a], [b]) => {
       if (a === "" && b !== "") return 1;
       if (a !== "" && b === "") return -1;
+      if (groupBy === "date") return b.localeCompare(a); // newest first
       return a.localeCompare(b);
     });
     return entries.map(([key, posts]) => ({
-      label: groupBy === "date" ? key : (key === "" ? "null" : (posts[0]?.keyword ?? key)),
+      label: key === "" ? (groupBy === "keyword" ? "Vibe / No keyword" : "Unknown") : key,
       posts,
     }));
   })();
-  const modal = modalIdx !== null ? (allPosts[modalIdx] ?? null) : null;
 
-  const openModal = (post: GalleryPost) => setModalIdx(allPosts.findIndex((p) => p.id === post.id));
+  // Modal operates over vibe-filtered or all posts depending on mode
+  const modalPosts = groupBy === "vibe" ? vibePosts : allPosts;
+  const modal = modalIdx !== null ? (modalPosts[modalIdx] ?? null) : null;
+
+  const openModal = (post: GalleryPost) =>
+    setModalIdx(modalPosts.findIndex((p) => p.id === post.id));
   const prev = () => setModalIdx((i) => (i !== null && i > 0 ? i - 1 : i));
-  const next = () => setModalIdx((i) => (i !== null && i < allPosts.length - 1 ? i + 1 : i));
+  const next = () =>
+    setModalIdx((i) => (i !== null && i < modalPosts.length - 1 ? i + 1 : i));
 
   useEffect(() => {
     async function load() {
@@ -76,7 +107,6 @@ export default function Gallery() {
     void load();
   }, []);
 
-  // Keyboard navigation
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") setModalIdx(null);
@@ -116,13 +146,22 @@ export default function Gallery() {
           <h1 style={s.title}>Gallery</h1>
           <div style={s.pageHeaderRight}>
             {!loading && totalPosts > 0 && (
-              <span style={s.count}>{totalPosts} saved</span>
+              <span style={s.count}>
+                {groupBy === "vibe" && selectedKeywords.size > 0
+                  ? `${vibePosts.length} / ${totalPosts}`
+                  : totalPosts}{" "}
+                saved
+              </span>
             )}
             {(["date", "keyword", "vibe"] as GroupBy[]).map((g) => (
               <button
                 key={g}
                 style={{ ...s.groupBtn, ...(groupBy === g ? s.groupBtnActive : {}) }}
-                onClick={() => setGroupBy(g)}
+                onClick={() => {
+                  setGroupBy(g);
+                  setModalIdx(null);
+                  if (g !== "vibe") setSelectedKeywords(new Set());
+                }}
               >
                 {g === "date" ? "Date" : g === "keyword" ? "Keyword" : "Vibe"}
               </button>
@@ -142,31 +181,63 @@ export default function Gallery() {
           </p>
         )}
 
-        {groups.map((group) => (
-          <section key={group.label} style={s.section}>
-            <h2 style={s.dateHeader}>{group.label}</h2>
-            <div style={s.grid}>
-              {group.posts.map((post) => (
-                <button
-                  key={post.id}
-                  style={s.thumb}
-                  onClick={() => openModal(post)}
-                  title={`@${post.creator}`}
-                >
-                  {post.screenshot_url ? (
-                    <img
-                      src={post.screenshot_url}
-                      alt={`@${post.creator}`}
-                      style={s.thumbImg}
-                    />
-                  ) : (
-                    <div style={s.noThumb}>No image</div>
-                  )}
-                </button>
-              ))}
-            </div>
-          </section>
-        ))}
+        {/* Vibe mode: keyword filter chips + flat grid */}
+        {groupBy === "vibe" && !loading && allPosts.length > 0 && (
+          <>
+            {allVibeKeywords.length > 0 ? (
+              <div style={s.filterBar}>
+                {selectedKeywords.size > 0 && (
+                  <button
+                    style={s.clearBtn}
+                    onClick={() => { setSelectedKeywords(new Set()); setModalIdx(null); }}
+                  >
+                    Clear
+                  </button>
+                )}
+                {allVibeKeywords.map((kw) => {
+                  const active = selectedKeywords.has(kw);
+                  return (
+                    <button
+                      key={kw}
+                      style={{ ...s.chip, ...(active ? s.chipActive : {}) }}
+                      onClick={() => toggleKeyword(kw)}
+                    >
+                      {kw}
+                      <span style={active ? s.chipCountActive : s.chipCount}>
+                        {keywordFreq.get(kw)}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            ) : (
+              <p style={s.empty}>No vibe keywords yet — like some posts to build your taste profile.</p>
+            )}
+            {vibePosts.length === 0 && selectedKeywords.size > 0 && (
+              <p style={s.empty}>No posts match the selected keywords.</p>
+            )}
+            {vibePosts.length > 0 && (
+              <div style={s.grid}>
+                {vibePosts.map((post) => (
+                  <PostThumb key={post.id} post={post} onClick={() => openModal(post)} />
+                ))}
+              </div>
+            )}
+          </>
+        )}
+
+        {/* Date / Keyword mode: grouped sections */}
+        {groupBy !== "vibe" &&
+          groups.map((group) => (
+            <section key={group.label} style={s.section}>
+              <h2 style={s.sectionHeader}>{group.label}</h2>
+              <div style={s.grid}>
+                {group.posts.map((post) => (
+                  <PostThumb key={post.id} post={post} onClick={() => openModal(post)} />
+                ))}
+              </div>
+            </section>
+          ))}
       </main>
 
       {modal && modalIdx !== null && (
@@ -177,7 +248,7 @@ export default function Gallery() {
             {modalIdx > 0 && (
               <button style={{ ...s.navBtn, left: "0.5rem" }} onClick={prev} title="Previous (←)">‹</button>
             )}
-            {modalIdx < allPosts.length - 1 && (
+            {modalIdx < modalPosts.length - 1 && (
               <button style={{ ...s.navBtn, right: "0.5rem" }} onClick={next} title="Next (→)">›</button>
             )}
 
@@ -192,7 +263,7 @@ export default function Gallery() {
               <span style={s.modalEngagement}>
                 {modal.engagement.toLocaleString()} engagements
               </span>
-              <span style={s.modalCounter}>{modalIdx + 1} / {allPosts.length}</span>
+              <span style={s.modalCounter}>{modalIdx + 1} / {modalPosts.length}</span>
               <button
                 style={{ ...s.deleteBtn, ...(deleting ? s.deleteBtnDisabled : {}) }}
                 onClick={() => void handleDelete(modal)}
@@ -202,10 +273,29 @@ export default function Gallery() {
                 {deleting ? "…" : "🗑"}
               </button>
             </div>
+            {modal.vibe_keywords && modal.vibe_keywords.length > 0 && (
+              <div style={s.modalKeywords}>
+                {modal.vibe_keywords.map((kw) => (
+                  <span key={kw} style={s.modalKwChip}>{kw}</span>
+                ))}
+              </div>
+            )}
           </div>
         </div>
       )}
     </div>
+  );
+}
+
+function PostThumb({ post, onClick }: { post: GalleryPost; onClick: () => void }) {
+  return (
+    <button style={s.thumb} onClick={onClick} title={`@${post.creator}`}>
+      {post.screenshot_url ? (
+        <img src={post.screenshot_url} alt={`@${post.creator}`} style={s.thumbImg} />
+      ) : (
+        <div style={s.noThumb}>No image</div>
+      )}
+    </button>
   );
 }
 
@@ -265,8 +355,45 @@ const s: Record<string, CSSProperties> = {
   },
   empty: { color: "#555", padding: "2rem 0", fontSize: "0.9rem" },
   link: { color: "#888", textDecoration: "none" },
+  filterBar: {
+    display: "flex",
+    flexWrap: "wrap" as const,
+    gap: "0.4rem",
+    marginBottom: "1.5rem",
+    alignItems: "center",
+  },
+  clearBtn: {
+    background: "transparent",
+    border: "1px solid #333",
+    color: "#666",
+    borderRadius: 999,
+    padding: "0.3rem 0.7rem",
+    fontSize: "0.75rem",
+    cursor: "pointer",
+    fontWeight: 500,
+  },
+  chip: {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: "0.35rem",
+    background: "#1a1a1a",
+    border: "1px solid #2a2a2a",
+    color: "#888",
+    borderRadius: 999,
+    padding: "0.3rem 0.65rem",
+    fontSize: "0.78rem",
+    cursor: "pointer",
+    fontWeight: 500,
+  },
+  chipActive: {
+    background: "#0d2b1a",
+    border: "1px solid #2e7d32",
+    color: "#e8e8e8",
+  },
+  chipCount: { color: "#444", fontSize: "0.7rem" },
+  chipCountActive: { color: "#4caf50", fontSize: "0.7rem" },
   section: { marginBottom: "3rem" },
-  dateHeader: {
+  sectionHeader: {
     fontSize: "0.78rem",
     fontWeight: 600,
     color: "#555",
@@ -389,4 +516,20 @@ const s: Record<string, CSSProperties> = {
     flexShrink: 0,
   },
   deleteBtnDisabled: { opacity: 0.4, cursor: "not-allowed" },
+  modalKeywords: {
+    display: "flex",
+    flexWrap: "wrap" as const,
+    gap: "0.35rem",
+    padding: "0.6rem 1rem",
+    borderTop: "1px solid #1e1e1e",
+    flexShrink: 0,
+  },
+  modalKwChip: {
+    background: "#111",
+    border: "1px solid #2a2a2a",
+    color: "#555",
+    borderRadius: 999,
+    padding: "0.15rem 0.55rem",
+    fontSize: "0.72rem",
+  },
 };

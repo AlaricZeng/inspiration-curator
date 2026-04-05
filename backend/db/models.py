@@ -46,6 +46,7 @@ class Post(SQLModel, table=True):
     status: PostStatus = Field(default=PostStatus.pending)
     engagement: int = Field(default=0)
     keyword: Optional[str] = None
+    vibe_keywords: Optional[str] = None  # comma-separated keywords extracted by LLM after liking
 
 
 class Creator(SQLModel, table=True):

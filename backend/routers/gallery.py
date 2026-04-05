@@ -30,6 +30,7 @@ class GalleryPostOut(BaseModel):
     date: str
     keyword: Optional[str]
     run_mode: str  # "keyword" | "vibe"
+    vibe_keywords: Optional[list[str]] = None
 
 
 class GalleryDay(BaseModel):
@@ -64,6 +65,7 @@ async def get_gallery() -> list[GalleryDay]:
                 date=date_str,
                 keyword=post.keyword,
                 run_mode="keyword" if post.keyword else "vibe",
+                vibe_keywords=[kw.strip() for kw in post.vibe_keywords.split(",")] if post.vibe_keywords else None,
             )
         )
 

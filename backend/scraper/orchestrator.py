@@ -248,11 +248,12 @@ def _get_top_creator(platform: Platform) -> str | None:
         return creator.handle if creator else None
 
 
-def _get_top_tags(n: int) -> list[str]:
-    """Return the top-n hashtags from liked posts, ranked by how many liked posts share them."""
+def _get_top_tags(n: int, platform: Platform) -> list[str]:
+    """Return the top-n hashtags from liked posts for a specific platform,
+    ranked by how many liked posts share them."""
     with Session(engine) as session:
         liked_posts = session.exec(
-            select(Post).where(Post.status == PostStatus.liked)
+            select(Post).where(Post.status == PostStatus.liked, Post.platform == platform)
         ).all()
 
     tag_counts: dict[str, int] = {}
@@ -274,7 +275,7 @@ async def _discover_instagram(seen_urls: set[str]) -> list[PostCandidate]:
     Returns an empty list if no creators or tags have been recorded yet.
     """
     top_creator = _get_top_creator(Platform.instagram)
-    top_tags = _get_top_tags(3)
+    top_tags = _get_top_tags(3, Platform.instagram)
 
     candidates: list[PostCandidate] = []
     local_seen = set(seen_urls)
@@ -321,7 +322,7 @@ async def _discover_xhs(seen_urls: set[str]) -> list[PostCandidate]:
     into a single call. Returns an empty list if no creators or tags exist yet.
     """
     top_creator = _get_top_creator(Platform.xiaohongshu)
-    top_tags = _get_top_tags(3)
+    top_tags = _get_top_tags(3, Platform.xiaohongshu)
 
     keyword = top_tags[0] if top_tags else None
     creator_handles = [top_creator] if top_creator else []

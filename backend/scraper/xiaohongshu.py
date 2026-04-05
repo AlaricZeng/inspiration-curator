@@ -20,6 +20,7 @@ Raises SessionExpiredError if a login wall is detected.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 from urllib.parse import quote, urlparse
@@ -168,7 +169,7 @@ async def _scrape_keyword(
         )
         processed_offset = len(all_cards)
 
-        # Harvest the new batch
+        # Harvest the new batch (visits each note page, then returns to listing)
         batch_candidates = await _harvest_cards(
             new_cards, cookie_header, limit - len(candidates),
             from_creator=False, skip_urls=seen_urls,
@@ -276,12 +277,61 @@ class _NoteCard:
 async def _collect_all_cards(page: Page) -> list[_NoteCard]:
     """Collect ALL currently-visible note cards from the page (no limit).
 
-    Returns them in DOM order. The caller slices by offset to get only
+    Iterates section.note-item elements to pair each note URL with its cover
+    image and creator handle in one pass. Falls back to the old URL+image
+    zip approach if no note-item sections are found.
+
+    Returns cards in DOM order. The caller slices by offset to get only
     the cards that are new since the previous round.
     """
+    cards: list[_NoteCard] = []
     seen_urls: set[str] = set()
-    note_urls: list[str] = []
 
+    sections = await page.query_selector_all("section.note-item")
+    if sections:
+        for section in sections:
+            try:
+                # Note URL — prefer the hidden plain /explore/ link
+                note_url = ""
+                for link_el in await section.query_selector_all('a[href*="/explore/"]'):
+                    href = await link_el.get_attribute("href") or ""
+                    full = (href if href.startswith("http") else f"{_BASE}{href}").split("?")[0].rstrip("/")
+                    if full not in seen_urls:
+                        note_url = full
+                        break
+
+                if not note_url or note_url in seen_urls:
+                    continue
+                seen_urls.add(note_url)
+
+                # Creator display name from the author link text (first line, before the date)
+                creator = ""
+                author_el = await section.query_selector('a.author[href*="/user/profile/"]')
+                if author_el:
+                    text = (await author_el.inner_text()).strip()
+                    creator = text.split("\n")[0].strip()
+
+                # Cover image (exclude avatars)
+                cover_src = ""
+                for img_el in await section.query_selector_all("img[data-xhs-img]"):
+                    src = (await img_el.get_attribute("src") or "").strip()
+                    if src and not src.startswith("data:") and "avatar" not in src:
+                        cover_src = src
+                        break
+
+                if not cover_src:
+                    logger.debug("XHS: no cover image for %s, skipping", note_url)
+                    continue
+
+                cards.append(_NoteCard(url=note_url, cover_img_url=cover_src, creator=creator))
+            except Exception:
+                continue
+
+        logger.debug("XHS DOM: %d note-item sections → %d cards", len(sections), len(cards))
+        return cards
+
+    # Fallback: zip note URLs with cover images (no creator info)
+    note_urls: list[str] = []
     for pattern in ['a[href*="/explore/"]', 'a[href*="/discovery/item/"]']:
         links = await page.query_selector_all(pattern)
         for link in links:
@@ -295,10 +345,7 @@ async def _collect_all_cards(page: Page) -> list[_NoteCard]:
                 continue
 
     cover_srcs: list[str] = []
-    for sel in [
-        'img[data-xhs-img][elementtiming="card-exposed"]',
-        'img[data-xhs-img]',
-    ]:
+    for sel in ['img[data-xhs-img][elementtiming="card-exposed"]', 'img[data-xhs-img]']:
         imgs = await page.query_selector_all(sel)
         if imgs:
             for img in imgs:
@@ -310,17 +357,82 @@ async def _collect_all_cards(page: Page) -> list[_NoteCard]:
                     continue
             break
 
-    logger.debug("XHS DOM: %d note URLs, %d cover images", len(note_urls), len(cover_srcs))
-
-    cards: list[_NoteCard] = []
+    logger.debug("XHS DOM fallback: %d note URLs, %d cover images", len(note_urls), len(cover_srcs))
     for i, url in enumerate(note_urls):
         cover_src = cover_srcs[i] if i < len(cover_srcs) else ""
         if not cover_src:
-            logger.debug("XHS: no cover image for card %d (%s), skipping", i, url)
             continue
         cards.append(_NoteCard(url=url, cover_img_url=cover_src))
 
     return cards
+
+
+async def _fetch_note_metadata(page: Page, note_url: str) -> tuple[list[str], str]:
+    """Navigate to a note page and extract hashtags and the creator's handle.
+
+    Hashtags: <a> elements whose text starts with '#' in the note description.
+    Creator:  the author profile link href contains '/user/profile/<handle>'.
+
+    Returns (tags, creator_handle). Either may be empty/blank if not found.
+    """
+    try:
+        await page.goto(note_url, wait_until="domcontentloaded", timeout=20_000)
+        await page.wait_for_timeout(1_500)
+        await _assert_not_login_wall(page)
+    except SessionExpiredError:
+        raise
+    except Exception as exc:
+        logger.debug("XHS: failed to load note page %s: %s", note_url, exc)
+        return [], ""
+
+    tags: list[str] = []
+    creator: str = ""
+
+    try:
+        # --- Creator handle ---
+        for selector in [
+            "a[href*='/user/profile/']",
+            ".author-wrapper a",
+            ".user-info a",
+        ]:
+            el = await page.query_selector(selector)
+            if el:
+                href = (await el.get_attribute("href") or "").strip()
+                match = re.search(r"/user/profile/([^/?#]+)", href)
+                if match:
+                    creator = match.group(1)
+                    break
+
+        # --- Hashtags ---
+        for selector in [
+            "#detail-desc a",
+            ".note-content a",
+            ".desc a",
+            "a[href*='search']",
+        ]:
+            els = await page.query_selector_all(selector)
+            for el in els:
+                text = (await el.inner_text()).strip()
+                if text.startswith("#"):
+                    tag = text.lstrip("#").strip()
+                    if tag and tag not in tags:
+                        tags.append(tag)
+            if tags:
+                break
+
+        # Broad fallback: scan all <a> text for '#...' tokens
+        if not tags:
+            for el in await page.query_selector_all("a"):
+                text = (await el.inner_text()).strip()
+                if text.startswith("#"):
+                    tag = text.lstrip("#").strip()
+                    if tag and tag not in tags:
+                        tags.append(tag)
+    except Exception as exc:
+        logger.debug("XHS: metadata extraction failed for %s: %s", note_url, exc)
+
+    logger.debug("XHS: %s → creator=%r tags=%s", note_url, creator, tags)
+    return tags, creator
 
 
 async def _harvest_cards(

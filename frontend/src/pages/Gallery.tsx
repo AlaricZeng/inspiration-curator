@@ -30,6 +30,7 @@ export default function Gallery() {
   const [deleting, setDeleting] = useState(false);
   const [groupBy, setGroupBy] = useState<GroupBy>("date");
   const [selectedKeywords, setSelectedKeywords] = useState<Set<string>>(new Set());
+  const [tagPlatform, setTagPlatform] = useState<"instagram" | "xiaohongshu">("instagram");
 
   const allPosts = days.flatMap((d) => d.posts);
 
@@ -49,21 +50,25 @@ export default function Gallery() {
       ? allPosts
       : allPosts.filter((p) => p.vibe_keywords?.some((kw) => selectedKeywords.has(kw)));
 
-  // --- Tags mode: scraped hashtag filter ---
-  const tagFreq = new Map<string, number>();
+  // --- Tags mode: scraped hashtag filter, split by platform ---
+  const igTagFreq = new Map<string, number>();
+  const xhsTagFreq = new Map<string, number>();
   for (const post of allPosts) {
+    const freq = post.platform === "instagram" ? igTagFreq : xhsTagFreq;
     for (const tag of post.tags ?? []) {
-      tagFreq.set(tag, (tagFreq.get(tag) ?? 0) + 1);
+      freq.set(tag, (freq.get(tag) ?? 0) + 1);
     }
   }
-  const allTags = Array.from(tagFreq.entries())
-    .sort((a, b) => b[1] - a[1])
-    .map(([tag]) => tag);
+  const igTags = Array.from(igTagFreq.entries()).sort((a, b) => b[1] - a[1]).map(([t]) => t);
+  const xhsTags = Array.from(xhsTagFreq.entries()).sort((a, b) => b[1] - a[1]).map(([t]) => t);
 
-  const tagPosts =
-    selectedKeywords.size === 0
-      ? allPosts
-      : allPosts.filter((p) => p.tags?.some((tag) => selectedKeywords.has(tag)));
+  const igTagPosts = allPosts.filter(
+    (p) => p.platform === "instagram" && (selectedKeywords.size === 0 || p.tags?.some((t) => selectedKeywords.has(t)))
+  );
+  const xhsTagPosts = allPosts.filter(
+    (p) => p.platform === "xiaohongshu" && (selectedKeywords.size === 0 || p.tags?.some((t) => selectedKeywords.has(t)))
+  );
+  const tagPosts = [...igTagPosts, ...xhsTagPosts];
 
   const toggleKeyword = (kw: string) => {
     setSelectedKeywords((prev) => {
@@ -244,53 +249,74 @@ export default function Gallery() {
           </>
         )}
 
-        {/* Tags mode: scraped hashtag filter chips + flat grid */}
-        {groupBy === "tags" && !loading && allPosts.length > 0 && (
-          <>
-            {allTags.length > 0 ? (
-              <div style={s.filterBar}>
-                {selectedKeywords.size > 0 && (
+        {/* Tags mode: platform tabs + chips + grid */}
+        {groupBy === "tags" && !loading && allPosts.length > 0 && (() => {
+          const activeTags = tagPlatform === "instagram" ? igTags : xhsTags;
+          const activeFreq = tagPlatform === "instagram" ? igTagFreq : xhsTagFreq;
+          const activePosts = tagPlatform === "instagram" ? igTagPosts : xhsTagPosts;
+          return (
+            <>
+              {/* Platform tabs */}
+              <div style={s.platformTabs}>
+                {(["instagram", "xiaohongshu"] as const).map((p) => (
                   <button
-                    style={s.clearBtn}
-                    onClick={() => { setSelectedKeywords(new Set()); setModalIdx(null); }}
+                    key={p}
+                    style={{ ...s.platformTab, ...(tagPlatform === p ? s.platformTabActive : {}) }}
+                    onClick={() => { setTagPlatform(p); setSelectedKeywords(new Set()); setModalIdx(null); }}
                   >
-                    Clear
+                    {p === "instagram" ? "Instagram" : "小红书"}
                   </button>
-                )}
-                {allTags.map((tag) => {
-                  const active = selectedKeywords.has(tag);
-                  return (
-                    <button
-                      key={tag}
-                      style={{ ...s.chip, ...(active ? s.chipActive : {}) }}
-                      onClick={() => toggleKeyword(tag)}
-                    >
-                      #{tag}
-                      <span style={active ? s.chipCountActive : s.chipCount}>
-                        {tagFreq.get(tag)}
-                      </span>
-                    </button>
-                  );
-                })}
-              </div>
-            ) : (
-              <p style={s.empty}>No tags yet — tags are scraped from Instagram post hashtags.</p>
-            )}
-            {tagPosts.length === 0 && selectedKeywords.size > 0 && (
-              <p style={s.empty}>No posts match the selected tags.</p>
-            )}
-            {tagPosts.length > 0 && (
-              <div style={s.grid}>
-                {tagPosts.map((post) => (
-                  <PostThumb key={post.id} post={post} onClick={() => openModal(post)} />
                 ))}
               </div>
-            )}
-          </>
-        )}
+
+              {/* Chips */}
+              {activeTags.length > 0 ? (
+                <div style={s.filterBar}>
+                  {selectedKeywords.size > 0 && (
+                    <button
+                      style={s.clearBtn}
+                      onClick={() => { setSelectedKeywords(new Set()); setModalIdx(null); }}
+                    >
+                      Clear
+                    </button>
+                  )}
+                  {activeTags.map((tag) => {
+                    const active = selectedKeywords.has(tag);
+                    return (
+                      <button
+                        key={tag}
+                        style={{ ...s.chip, ...(active ? s.chipActive : {}) }}
+                        onClick={() => toggleKeyword(tag)}
+                      >
+                        #{tag}
+                        <span style={active ? s.chipCountActive : s.chipCount}>
+                          {activeFreq.get(tag)}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              ) : (
+                <p style={s.empty}>No tags yet for this platform.</p>
+              )}
+
+              {/* Grid */}
+              {activePosts.length === 0 && selectedKeywords.size > 0 && (
+                <p style={s.empty}>No posts match the selected tags.</p>
+              )}
+              {activePosts.length > 0 && (
+                <div style={s.grid}>
+                  {activePosts.map((post) => (
+                    <PostThumb key={post.id} post={post} onClick={() => openModal(post)} />
+                  ))}
+                </div>
+              )}
+            </>
+          );
+        })()}
 
         {/* Date / Keyword mode: grouped sections */}
-        {groupBy !== "vibe" &&
+        {groupBy !== "vibe" && groupBy !== "tags" &&
           groups.map((group) => (
             <section key={group.label} style={s.section}>
               <h2 style={s.sectionHeader}>{group.label}</h2>
@@ -597,6 +623,26 @@ const s: Record<string, CSSProperties> = {
     borderRadius: 999,
     padding: "0.15rem 0.55rem",
     fontSize: "0.72rem",
+  },
+  platformTabs: {
+    display: "flex",
+    gap: "0.35rem",
+    marginBottom: "1.25rem",
+  },
+  platformTab: {
+    background: "#1a1a1a",
+    border: "1px solid #2a2a2a",
+    color: "#555",
+    borderRadius: 6,
+    padding: "0.3rem 0.85rem",
+    fontSize: "0.8rem",
+    cursor: "pointer",
+    fontWeight: 500,
+  },
+  platformTabActive: {
+    background: "#252525",
+    border: "1px solid #444",
+    color: "#e8e8e8",
   },
   modalTagChip: {
     background: "#111",

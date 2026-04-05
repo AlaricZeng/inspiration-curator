@@ -171,7 +171,7 @@ async def _scrape_keyword(
 
         # Harvest the new batch (visits each note page, then returns to listing)
         batch_candidates = await _harvest_cards(
-            new_cards, cookie_header, limit - len(candidates),
+            new_cards, page, url, cookie_header, limit - len(candidates),
             from_creator=False, skip_urls=seen_urls,
         )
         for c in batch_candidates:
@@ -233,7 +233,7 @@ async def _scrape_creator(
         processed_offset = len(all_cards)
 
         batch_candidates = await _harvest_cards(
-            new_cards, cookie_header, limit - len(candidates),
+            new_cards, page, url, cookie_header, limit - len(candidates),
             from_creator=True, skip_urls=seen_urls,
         )
         for c in batch_candidates:
@@ -272,6 +272,7 @@ class _NoteCard:
     cover_img_url: str
     creator: str = ""
     engagement: int = 0
+    detail_url: str = ""  # full URL with xsec_token, opens the note modal when navigated to
 
 
 async def _collect_all_cards(page: Page) -> list[_NoteCard]:
@@ -291,7 +292,7 @@ async def _collect_all_cards(page: Page) -> list[_NoteCard]:
     if sections:
         for section in sections:
             try:
-                # Note URL — prefer the hidden plain /explore/ link
+                # Note URL — strip query params from the hidden plain /explore/ link
                 note_url = ""
                 for link_el in await section.query_selector_all('a[href*="/explore/"]'):
                     href = await link_el.get_attribute("href") or ""
@@ -303,6 +304,13 @@ async def _collect_all_cards(page: Page) -> list[_NoteCard]:
                 if not note_url or note_url in seen_urls:
                     continue
                 seen_urls.add(note_url)
+
+                # Detail URL — full tokenised href from a.cover, needed to open the note modal
+                detail_url = ""
+                cover_link = await section.query_selector("a.cover")
+                if cover_link:
+                    href = await cover_link.get_attribute("href") or ""
+                    detail_url = href if href.startswith("http") else f"{_BASE}{href}"
 
                 # Creator display name from the author link text (first line, before the date)
                 creator = ""
@@ -323,7 +331,7 @@ async def _collect_all_cards(page: Page) -> list[_NoteCard]:
                     logger.debug("XHS: no cover image for %s, skipping", note_url)
                     continue
 
-                cards.append(_NoteCard(url=note_url, cover_img_url=cover_src, creator=creator))
+                cards.append(_NoteCard(url=note_url, cover_img_url=cover_src, creator=creator, detail_url=detail_url))
             except Exception:
                 continue
 
@@ -435,16 +443,64 @@ async def _fetch_note_metadata(page: Page, note_url: str) -> tuple[list[str], st
     return tags, creator
 
 
+async def _fetch_note_tags(page: Page, listing_url: str, detail_url: str) -> list[str]:
+    """Navigate to a note's detail URL, extract hashtags from the modal, then return to listing.
+
+    XHS notes only render inside a modal when navigated to via the tokenised
+    cover URL (e.g. /search_result/<id>?xsec_token=...). Plain /explore/<id>
+    URLs redirect to the feed. After extraction we navigate back to listing_url.
+
+    Returns a list of tag strings (without the leading '#').
+    """
+    if not detail_url:
+        return []
+    try:
+        await page.goto(detail_url, wait_until="domcontentloaded", timeout=20_000)
+        await page.wait_for_selector("#detail-desc", timeout=8_000)
+    except Exception as exc:
+        logger.debug("XHS: could not load note detail %s: %s", detail_url, exc)
+        try:
+            await page.goto(listing_url, wait_until="domcontentloaded", timeout=20_000)
+        except Exception:
+            pass
+        return []
+
+    tags: list[str] = []
+    try:
+        els = await page.query_selector_all("#detail-desc a.tag")
+        for el in els:
+            text = (await el.inner_text()).strip().lstrip("#").strip()
+            if text and text not in tags:
+                tags.append(text)
+    except Exception as exc:
+        logger.debug("XHS: tag extraction failed: %s", exc)
+
+    logger.debug("XHS: %s → tags %s", detail_url, tags)
+
+    try:
+        await page.goto(listing_url, wait_until="domcontentloaded", timeout=20_000)
+        await page.wait_for_timeout(1_000)
+    except Exception as exc:
+        logger.debug("XHS: failed to return to listing %s: %s", listing_url, exc)
+
+    return tags
+
+
 async def _harvest_cards(
     cards: list[_NoteCard],
+    page: Page,
+    listing_url: str,
     cookie_header: str,
     limit: int,
     *,
     from_creator: bool,
     skip_urls: set[str] | None = None,
 ) -> list[PostCandidate]:
-    """Download cover images for *cards* and return PostCandidates.
+    """Download cover images and extract hashtags for *cards*, returning PostCandidates.
 
+    For each fresh card: fetches the cover image via httpx, then navigates to
+    the note's tokenised detail URL to extract hashtags from the modal, then
+    returns to listing_url for the next scroll round.
     Only processes up to *limit* fresh cards (those not in *skip_urls*).
     """
     candidates: list[PostCandidate] = []
@@ -484,12 +540,15 @@ async def _harvest_cards(
             if not screenshot_data:
                 continue
 
+            tags = await _fetch_note_tags(page, listing_url, card.detail_url)
+
             candidates.append(PostCandidate(
                 source_url=card.url,
                 creator=card.creator,
                 engagement=card.engagement,
                 screenshot_data=screenshot_data,
                 from_creator=from_creator,
+                tags=tags,
             ))
 
     return candidates

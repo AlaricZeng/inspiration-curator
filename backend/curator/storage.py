@@ -21,11 +21,9 @@ def _platform_prefix(platform: Platform) -> str:
 
 
 def _dest_path(post: Post, day_dir: Path) -> Path:
-    """Return next available destination path for *post* inside *day_dir*."""
+    """Return a unique destination path for *post* inside *day_dir*."""
     prefix = _platform_prefix(post.platform)
-    existing = sorted(day_dir.glob(f"{prefix}_*.png"))
-    seq = len(existing) + 1
-    return day_dir / f"{prefix}_{seq:02d}.png"
+    return day_dir / f"{prefix}_{post.id[:8]}.png"
 
 
 def save_liked_screenshot(post: Post) -> str:

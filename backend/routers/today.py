@@ -185,7 +185,7 @@ async def set_today_keyword(body: KeywordBody) -> KeywordResponse:
 
 @router.post("/api/posts/{post_id}/like", response_model=ActionResponse)
 async def like_post(post_id: str, background_tasks: BackgroundTasks) -> ActionResponse:
-    from backend.curator.storage import save_liked_screenshot, trigger_vibe_analysis
+    from backend.curator.storage import record_liked_metadata, save_liked_screenshot, trigger_vibe_analysis
 
     with Session(engine) as session:
         post = session.get(Post, post_id)
@@ -204,6 +204,8 @@ async def like_post(post_id: str, background_tasks: BackgroundTasks) -> ActionRe
         session.add(post)
         session.commit()
 
+    # Record creator + tags immediately (no LLM) so vibe-mode scraping can use them right away
+    record_liked_metadata(post_id)
     background_tasks.add_task(trigger_vibe_analysis, post_id)
     return ActionResponse(status="liked", saved_path=saved_path)
 

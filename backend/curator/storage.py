@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import logging
 import shutil
 from pathlib import Path
 
-from backend.db.models import Platform, Post
+from sqlmodel import Session, select
+
+from backend.db.models import Creator, Platform, Post, engine
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +61,38 @@ def delete_staging_screenshot(post: Post) -> None:
         logger.info("Deleted staging screenshot: %s", src)
     except Exception as exc:
         logger.warning("Could not delete staging screenshot %s: %s", src, exc)
+
+
+def record_liked_metadata(post_id: str) -> None:
+    """Immediately record creator and scraped tags when a post is liked.
+
+    This runs synchronously in the like endpoint (no LLM needed) so the data
+    is available for the next vibe-mode scrape even if the LLM analysis fails.
+    """
+    with Session(engine) as session:
+        post = session.get(Post, post_id)
+        if post is None:
+            return
+
+        # Upsert creator
+        if post.creator:
+            existing = session.exec(
+                select(Creator).where(
+                    Creator.platform == post.platform,
+                    Creator.handle == post.creator,
+                )
+            ).first()
+            if existing:
+                existing.liked_count += 1
+                session.add(existing)
+            else:
+                session.add(Creator(platform=post.platform, handle=post.creator, liked_count=1))
+
+        session.commit()
+        logger.info(
+            "Recorded liked metadata for post %s (creator=%r, tags=%r)",
+            post_id, post.creator, post.tags,
+        )
 
 
 async def trigger_vibe_analysis(post_id: str) -> None:

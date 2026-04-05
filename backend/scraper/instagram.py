@@ -165,12 +165,17 @@ def _scrape_hashtag(
                 if not screenshot_data:
                     continue
 
+                caption_obj = media.get("caption")
+                caption_text = caption_obj.get("text", "") if isinstance(caption_obj, dict) else ""
+                tags = [w.lstrip("#") for w in caption_text.split() if w.startswith("#")]
+
                 candidates.append(PostCandidate(
                     source_url=source_url,
                     creator=creator,
                     engagement=engagement,
                     screenshot_data=screenshot_data,
                     from_creator=False,
+                    tags=tags,
                 ))
                 page_new += 1
 
@@ -258,6 +263,10 @@ def _post_to_candidate(
         source_url = f"https://www.instagram.com/p/{post.shortcode}/"
         creator = post.owner_username
         engagement = post.likes
+        try:
+            tags = list(post.caption_hashtags) if post.caption_hashtags else []
+        except Exception:
+            tags = []
         # post.url is already the full-resolution image URL
         try:
             resp = L.context._session.get(post.url, timeout=15)
@@ -271,6 +280,7 @@ def _post_to_candidate(
             engagement=engagement,
             screenshot_data=screenshot_data,
             from_creator=from_creator,
+            tags=tags,
         )
     except Exception as exc:
         logger.debug("Skipping post due to error: %s", exc)

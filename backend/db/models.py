@@ -46,6 +46,7 @@ class Post(SQLModel, table=True):
     status: PostStatus = Field(default=PostStatus.pending)
     engagement: int = Field(default=0)
     keyword: Optional[str] = None
+    tags: Optional[str] = None  # comma-separated hashtags/topics scraped from the post
     vibe_keywords: Optional[str] = None  # comma-separated keywords extracted by LLM after liking
 
 
@@ -87,3 +88,16 @@ engine = create_engine(DATABASE_URL, echo=False, connect_args={"check_same_threa
 
 def create_db_and_tables() -> None:
     SQLModel.metadata.create_all(engine)
+    _run_migrations()
+
+
+def _run_migrations() -> None:
+    """Apply any schema migrations not handled by create_all (new columns on existing tables)."""
+    from sqlalchemy import text
+
+    with engine.connect() as conn:
+        # Add Post.tags column if it doesn't exist (added when scraped tags feature was introduced)
+        columns = [row[1] for row in conn.execute(text("PRAGMA table_info(post)"))]
+        if "tags" not in columns:
+            conn.execute(text("ALTER TABLE post ADD COLUMN tags TEXT"))
+            conn.commit()

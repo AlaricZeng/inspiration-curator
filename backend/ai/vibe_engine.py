@@ -9,9 +9,9 @@ import logging
 import os
 from pathlib import Path
 
-from sqlmodel import Session, select
+from sqlmodel import Session
 
-from backend.db.models import Creator, Platform, Post, VibeKeyword, engine
+from backend.db.models import Post, VibeKeyword, engine
 
 logger = logging.getLogger(__name__)
 
@@ -122,22 +122,6 @@ def _upsert_keywords(keywords: list[str]) -> None:
         session.commit()
 
 
-def _upsert_creator(platform: Platform, handle: str) -> None:
-    with Session(engine) as session:
-        existing = session.exec(
-            select(Creator).where(
-                Creator.platform == platform,
-                Creator.handle == handle,
-            )
-        ).first()
-        if existing:
-            existing.liked_count += 1
-            session.add(existing)
-        else:
-            session.add(Creator(platform=platform, handle=handle, liked_count=1))
-        session.commit()
-
-
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
@@ -154,8 +138,6 @@ async def analyze_vibe(post_id: str) -> None:
             logger.warning("analyze_vibe: post %s not found.", post_id)
             return
         screenshot = post.screenshot
-        platform = post.platform
-        handle = post.creator
 
     if not screenshot or not Path(screenshot).exists():
         logger.warning("analyze_vibe: screenshot missing for post %s.", post_id)
@@ -180,7 +162,6 @@ async def analyze_vibe(post_id: str) -> None:
 
     logger.info("analyze_vibe: post %s → %s", post_id, keywords)
     _upsert_keywords(keywords)
-    _upsert_creator(platform, handle)
 
     with Session(engine) as session:
         post = session.get(Post, post_id)

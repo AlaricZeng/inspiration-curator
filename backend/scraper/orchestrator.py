@@ -5,7 +5,9 @@ Flow
 1. Get or create today's DailyRun record; mark it *running*.
 2. Determine mode:
      - keyword mode: today's DailyRun has a keyword set (by the user via the UI)
-     - vibe mode:    no keyword — use top-3 non-blocked VibeKeywords + all tracked creators
+     - discovery mode: no keyword — fetch from the most-liked creator (1-2 posts)
+                       then fill remaining slots from the top 3 hashtags shared
+                       across liked posts.
 3. Run Instagram scraper  → pick top 5 results.
 4. Run Xiaohongshu scraper → pick top 5 results.
 5. Save each screenshot to staging/YYYY-MM-DD/.
@@ -38,7 +40,6 @@ from backend.db.models import (
     PostStatus,
     RunMode,
     RunStatus,
-    VibeKeyword,
     engine,
 )
 from backend.scraper.browser import PLATFORM_CONFIG
@@ -78,7 +79,11 @@ async def run_scrape(force: bool = False) -> None:
     staging_dir = STAGING_DIR / str(today)
     staging_dir.mkdir(parents=True, exist_ok=True)
 
-    ig_keyword, ig_handles, xhs_keyword, xhs_handles, mode = _resolve_scrape_params(today)
+    # Determine mode: keyword (user set one) vs vibe (smart discovery)
+    with Session(engine) as session:
+        daily_run = session.exec(select(DailyRun).where(DailyRun.run_date == today)).first()
+        mode = RunMode.keyword if (daily_run and daily_run.keyword) else RunMode.vibe
+        keyword = daily_run.keyword if daily_run else None
 
     # Create PlatformRun records so the UI can track per-platform progress
     ig_run_id = _init_platform_run(run_id, Platform.instagram)
@@ -90,15 +95,19 @@ async def run_scrape(force: bool = False) -> None:
     # --- Instagram ---
     ig_candidates: list[PostCandidate] = []
     try:
-        logger.info("Starting Instagram scrape (keyword=%r, handles=%s)", ig_keyword, ig_handles)
-        results = await _scrape_instagram(
-            keyword=ig_keyword,
-            creator_handles=ig_handles,
-            max_results=_FETCH_LIMIT,
-            skip_urls=seen_urls,
-        )
-        ig_candidates = _weighted_sample(results, _PER_PLATFORM)
-        logger.info("Instagram returned %d fresh candidates (%d sampled).", len(results), len(ig_candidates))
+        if mode == RunMode.keyword:
+            logger.info("Starting Instagram scrape (keyword=%r)", keyword)
+            results = await _scrape_instagram(
+                keyword=keyword,
+                creator_handles=[],
+                max_results=_FETCH_LIMIT,
+                skip_urls=seen_urls,
+            )
+            ig_candidates = _weighted_sample(results, _PER_PLATFORM)
+        else:
+            logger.info("Starting Instagram discovery scrape")
+            ig_candidates = await _discover_instagram(seen_urls)
+        logger.info("Instagram returned %d candidates.", len(ig_candidates))
     except SessionExpiredError:
         logger.warning("Instagram session expired — marking for re-auth.")
         _invalidate_instagram_session()
@@ -107,10 +116,9 @@ async def run_scrape(force: bool = False) -> None:
     except Exception as exc:
         logger.error("Instagram scrape failed: %s", exc, exc_info=True)
 
-    # In vibe mode, don't store the vibe keyword on posts (it's a search hint, not a user keyword)
-    persist_keyword = ig_keyword if mode == RunMode.keyword else None
+    persist_keyword = keyword if mode == RunMode.keyword else None
 
-    # Persist Instagram results immediately so the user can curate without waiting for Red
+    # Persist Instagram results immediately so the user can curate without waiting for XHS
     ig_count = _persist_platform_results(run_id, Platform.instagram, ig_candidates, staging_dir, keyword=persist_keyword)
     _finish_platform_run(ig_run_id, ig_count, skipped=not ig_candidates)
 
@@ -120,15 +128,19 @@ async def run_scrape(force: bool = False) -> None:
     # --- Xiaohongshu ---
     xhs_candidates: list[PostCandidate] = []
     try:
-        logger.info("Starting Xiaohongshu scrape (keyword=%r, handles=%s)", xhs_keyword, xhs_handles)
-        results = await scrape_xiaohongshu(
-            keyword=xhs_keyword,
-            creator_handles=xhs_handles,
-            max_results=_PER_PLATFORM,
-            skip_urls=seen_urls,
-        )
-        xhs_candidates = _weighted_sample(results, _PER_PLATFORM)
-        logger.info("Xiaohongshu returned %d fresh candidates (%d sampled).", len(results), len(xhs_candidates))
+        if mode == RunMode.keyword:
+            logger.info("Starting Xiaohongshu scrape (keyword=%r)", keyword)
+            results = await scrape_xiaohongshu(
+                keyword=keyword,
+                creator_handles=[],
+                max_results=_PER_PLATFORM * 10,
+                skip_urls=seen_urls,
+            )
+            xhs_candidates = _weighted_sample(results, _PER_PLATFORM)
+        else:
+            logger.info("Starting Xiaohongshu discovery scrape")
+            xhs_candidates = await _discover_xhs(seen_urls)
+        logger.info("Xiaohongshu returned %d candidates.", len(xhs_candidates))
     except SessionExpiredError:
         logger.warning("Xiaohongshu session expired — marking for re-auth.")
         _invalidate_session("xiaohongshu")
@@ -224,35 +236,111 @@ def _init_daily_run(today: dt.date, force: bool = False) -> str | None:
         return daily_run.id
 
 
-def _resolve_scrape_params(
-    today: dt.date,
-) -> tuple[str | None, list[str], str | None, list[str], RunMode]:
-    """Return (ig_keyword, ig_handles, xhs_keyword, xhs_handles, mode)."""
+def _get_top_creator(platform: Platform) -> str | None:
+    """Return the handle of the most-liked creator for the given platform, or None."""
     with Session(engine) as session:
-        daily_run = session.exec(
-            select(DailyRun).where(DailyRun.run_date == today)
+        creator = session.exec(
+            select(Creator)
+            .where(Creator.platform == platform)
+            .order_by(Creator.liked_count.desc())
+            .limit(1)
         ).first()
+        return creator.handle if creator else None
 
-        if daily_run and daily_run.keyword:
-            # Keyword mode: both platforms search the same keyword, no creator profiles
-            kw = daily_run.keyword
-            return kw, [], kw, [], RunMode.keyword
 
-        # Vibe mode: pick randomly from top-5 non-blocked VibeKeywords (pinned first, then by frequency)
-        vibe_kws = session.exec(
-            select(VibeKeyword)
-            .where(VibeKeyword.user_blocked == False)  # noqa: E712
-            .order_by(VibeKeyword.user_pinned.desc(), VibeKeyword.frequency.desc())
-            .limit(5)
+def _get_top_tags(n: int) -> list[str]:
+    """Return the top-n hashtags from liked posts, ranked by how many liked posts share them."""
+    with Session(engine) as session:
+        liked_posts = session.exec(
+            select(Post).where(Post.status == PostStatus.liked)
         ).all()
-        keyword = random.choice(vibe_kws).keyword if vibe_kws else None
-        logger.info("Vibe mode: selected keyword %r from top-%d candidates.", keyword, len(vibe_kws))
 
-        creators = session.exec(select(Creator)).all()
-        ig_handles = [c.handle for c in creators if c.platform == Platform.instagram]
-        xhs_handles = [c.handle for c in creators if c.platform == Platform.xiaohongshu]
+    tag_counts: dict[str, int] = {}
+    for post in liked_posts:
+        if not post.tags:
+            continue
+        for tag in post.tags.split(","):
+            tag = tag.strip().lower()
+            if tag:
+                tag_counts[tag] = tag_counts.get(tag, 0) + 1
 
-        return keyword, ig_handles, keyword, xhs_handles, RunMode.vibe
+    return sorted(tag_counts, key=lambda t: -tag_counts[t])[:n]
+
+
+
+async def _discover_instagram(seen_urls: set[str]) -> list[PostCandidate]:
+    """Discovery-mode Instagram scrape: 1-2 posts from the most-liked creator,
+    then fill remaining slots from the top 3 hashtags shared across liked posts.
+    Returns an empty list if no creators or tags have been recorded yet.
+    """
+    top_creator = _get_top_creator(Platform.instagram)
+    top_tags = _get_top_tags(3)
+
+    candidates: list[PostCandidate] = []
+    local_seen = set(seen_urls)
+
+    # 1-2 posts from top liked creator
+    if top_creator:
+        results = await _scrape_instagram(
+            keyword=None,
+            creator_handles=[top_creator],
+            max_results=_FETCH_LIMIT,
+            skip_urls=local_seen,
+        )
+        picks = _weighted_sample(results, 2)
+        candidates.extend(picks)
+        local_seen.update(c.source_url for c in picks)
+        logger.info("IG discovery: %d post(s) from top creator @%s", len(picks), top_creator)
+
+    # Fill remaining slots with top 3 tags (distributed evenly)
+    if top_tags:
+        for i, tag in enumerate(top_tags):
+            if len(candidates) >= _PER_PLATFORM:
+                break
+            slots_left = _PER_PLATFORM - len(candidates)
+            tags_left = len(top_tags) - i
+            per_tag = math.ceil(slots_left / tags_left)
+            results = await _scrape_instagram(
+                keyword=tag,
+                creator_handles=[],
+                max_results=_FETCH_LIMIT,
+                skip_urls=local_seen,
+            )
+            picks = _weighted_sample(results, per_tag)
+            candidates.extend(picks)
+            local_seen.update(c.source_url for c in picks)
+            logger.info("IG discovery: %d post(s) from tag #%s", len(picks), tag)
+
+    return candidates
+
+
+async def _discover_xhs(seen_urls: set[str]) -> list[PostCandidate]:
+    """Discovery-mode Xiaohongshu scrape: top liked creator + top hashtag in one browser session.
+
+    XHS launches a full browser per call, so we combine creator profile and keyword
+    into a single call. Returns an empty list if no creators or tags exist yet.
+    """
+    top_creator = _get_top_creator(Platform.xiaohongshu)
+    top_tags = _get_top_tags(3)
+
+    keyword = top_tags[0] if top_tags else None
+    creator_handles = [top_creator] if top_creator else []
+
+    if not keyword and not creator_handles:
+        logger.info("XHS discovery: no creators or tags yet — skipping.")
+        return []
+
+    logger.info(
+        "XHS discovery: keyword=%r, creator=%r",
+        keyword, top_creator,
+    )
+    results = await scrape_xiaohongshu(
+        keyword=keyword,
+        creator_handles=creator_handles,
+        max_results=_PER_PLATFORM * 10,
+        skip_urls=seen_urls,
+    )
+    return _weighted_sample(results, _PER_PLATFORM)
 
 
 def _init_platform_run(run_id: str, platform: Platform) -> str:
@@ -317,6 +405,7 @@ def _persist_platform_results(
                 engagement=candidate.engagement,
                 status=PostStatus.pending,
                 keyword=keyword,
+                tags=",".join(candidate.tags) if candidate.tags else None,
             )
             session.add(post)
             existing_urls.add(candidate.source_url)

@@ -31,6 +31,7 @@ class GalleryPostOut(BaseModel):
     keyword: Optional[str]
     run_mode: str  # "keyword" | "vibe"
     vibe_keywords: Optional[list[str]] = None
+    tags: Optional[list[str]] = None  # scraped hashtags/topics from the post
 
 
 class GalleryDay(BaseModel):
@@ -66,6 +67,7 @@ async def get_gallery() -> list[GalleryDay]:
                 keyword=post.keyword,
                 run_mode="keyword" if post.keyword else "vibe",
                 vibe_keywords=[kw.strip() for kw in post.vibe_keywords.split(",")] if post.vibe_keywords else None,
+                tags=[t.strip() for t in post.tags.split(",") if t.strip()] if post.tags else None,
             )
         )
 

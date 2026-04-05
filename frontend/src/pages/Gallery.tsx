@@ -12,6 +12,7 @@ interface GalleryPost {
   keyword: string | null;
   run_mode: string;
   vibe_keywords: string[] | null;
+  tags: string[] | null;
 }
 
 interface GalleryDay {
@@ -19,7 +20,7 @@ interface GalleryDay {
   posts: GalleryPost[];
 }
 
-type GroupBy = "date" | "keyword" | "vibe";
+type GroupBy = "date" | "keyword" | "vibe" | "tags";
 
 export default function Gallery() {
   const [days, setDays] = useState<GalleryDay[]>([]);
@@ -47,6 +48,22 @@ export default function Gallery() {
     selectedKeywords.size === 0
       ? allPosts
       : allPosts.filter((p) => p.vibe_keywords?.some((kw) => selectedKeywords.has(kw)));
+
+  // --- Tags mode: scraped hashtag filter ---
+  const tagFreq = new Map<string, number>();
+  for (const post of allPosts) {
+    for (const tag of post.tags ?? []) {
+      tagFreq.set(tag, (tagFreq.get(tag) ?? 0) + 1);
+    }
+  }
+  const allTags = Array.from(tagFreq.entries())
+    .sort((a, b) => b[1] - a[1])
+    .map(([tag]) => tag);
+
+  const tagPosts =
+    selectedKeywords.size === 0
+      ? allPosts
+      : allPosts.filter((p) => p.tags?.some((tag) => selectedKeywords.has(tag)));
 
   const toggleKeyword = (kw: string) => {
     setSelectedKeywords((prev) => {
@@ -82,8 +99,9 @@ export default function Gallery() {
     }));
   })();
 
-  // Modal operates over vibe-filtered or all posts depending on mode
-  const modalPosts = groupBy === "vibe" ? vibePosts : allPosts;
+  // Modal operates over the active filtered set
+  const modalPosts =
+    groupBy === "vibe" ? vibePosts : groupBy === "tags" ? tagPosts : allPosts;
   const modal = modalIdx !== null ? (modalPosts[modalIdx] ?? null) : null;
 
   const openModal = (post: GalleryPost) =>
@@ -147,23 +165,23 @@ export default function Gallery() {
           <div style={s.pageHeaderRight}>
             {!loading && totalPosts > 0 && (
               <span style={s.count}>
-                {groupBy === "vibe" && selectedKeywords.size > 0
-                  ? `${vibePosts.length} / ${totalPosts}`
+                {(groupBy === "vibe" || groupBy === "tags") && selectedKeywords.size > 0
+                  ? `${modalPosts.length} / ${totalPosts}`
                   : totalPosts}{" "}
                 saved
               </span>
             )}
-            {(["date", "keyword", "vibe"] as GroupBy[]).map((g) => (
+            {(["date", "keyword", "vibe", "tags"] as GroupBy[]).map((g) => (
               <button
                 key={g}
                 style={{ ...s.groupBtn, ...(groupBy === g ? s.groupBtnActive : {}) }}
                 onClick={() => {
                   setGroupBy(g);
                   setModalIdx(null);
-                  if (g !== "vibe") setSelectedKeywords(new Set());
+                  setSelectedKeywords(new Set());
                 }}
               >
-                {g === "date" ? "Date" : g === "keyword" ? "Keyword" : "Vibe"}
+                {g === "date" ? "Date" : g === "keyword" ? "Keyword" : g === "vibe" ? "Vibe" : "Tags"}
               </button>
             ))}
           </div>
@@ -226,6 +244,51 @@ export default function Gallery() {
           </>
         )}
 
+        {/* Tags mode: scraped hashtag filter chips + flat grid */}
+        {groupBy === "tags" && !loading && allPosts.length > 0 && (
+          <>
+            {allTags.length > 0 ? (
+              <div style={s.filterBar}>
+                {selectedKeywords.size > 0 && (
+                  <button
+                    style={s.clearBtn}
+                    onClick={() => { setSelectedKeywords(new Set()); setModalIdx(null); }}
+                  >
+                    Clear
+                  </button>
+                )}
+                {allTags.map((tag) => {
+                  const active = selectedKeywords.has(tag);
+                  return (
+                    <button
+                      key={tag}
+                      style={{ ...s.chip, ...(active ? s.chipActive : {}) }}
+                      onClick={() => toggleKeyword(tag)}
+                    >
+                      #{tag}
+                      <span style={active ? s.chipCountActive : s.chipCount}>
+                        {tagFreq.get(tag)}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            ) : (
+              <p style={s.empty}>No tags yet — tags are scraped from Instagram post hashtags.</p>
+            )}
+            {tagPosts.length === 0 && selectedKeywords.size > 0 && (
+              <p style={s.empty}>No posts match the selected tags.</p>
+            )}
+            {tagPosts.length > 0 && (
+              <div style={s.grid}>
+                {tagPosts.map((post) => (
+                  <PostThumb key={post.id} post={post} onClick={() => openModal(post)} />
+                ))}
+              </div>
+            )}
+          </>
+        )}
+
         {/* Date / Keyword mode: grouped sections */}
         {groupBy !== "vibe" &&
           groups.map((group) => (
@@ -273,13 +336,16 @@ export default function Gallery() {
                 {deleting ? "…" : "🗑"}
               </button>
             </div>
-            {modal.vibe_keywords && modal.vibe_keywords.length > 0 && (
+            {(modal.vibe_keywords?.length || modal.tags?.length) ? (
               <div style={s.modalKeywords}>
-                {modal.vibe_keywords.map((kw) => (
+                {modal.vibe_keywords?.map((kw) => (
                   <span key={kw} style={s.modalKwChip}>{kw}</span>
                 ))}
+                {modal.tags?.map((tag) => (
+                  <span key={tag} style={s.modalTagChip}>#{tag}</span>
+                ))}
               </div>
-            )}
+            ) : null}
           </div>
         </div>
       )}
@@ -528,6 +594,14 @@ const s: Record<string, CSSProperties> = {
     background: "#111",
     border: "1px solid #2a2a2a",
     color: "#555",
+    borderRadius: 999,
+    padding: "0.15rem 0.55rem",
+    fontSize: "0.72rem",
+  },
+  modalTagChip: {
+    background: "#111",
+    border: "1px solid #1e2a1e",
+    color: "#3a5a3a",
     borderRadius: 999,
     padding: "0.15rem 0.55rem",
     fontSize: "0.72rem",

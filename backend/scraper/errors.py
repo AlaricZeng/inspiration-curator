@@ -22,3 +22,4 @@ class PostCandidate:
     engagement: int
     screenshot_data: bytes = field(default_factory=bytes)
     from_creator: bool = False  # True when scraped from a followed creator profile
+    tags: list[str] = field(default_factory=list)  # hashtags/topics extracted from the post

@@ -19,9 +19,8 @@ Raises SessionExpiredError if a login wall is detected.
 
 from __future__ import annotations
 
-import hashlib
+import json
 import logging
-import pickle
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -37,7 +36,7 @@ from backend.scraper.errors import PostCandidate, SessionExpiredError
 logger = logging.getLogger(__name__)
 
 _BASE = "https://www.xiaohongshu.com"
-_LOGIN_PATH_FRAGMENTS = ("/login",)
+_LOGIN_PATH_FRAGMENTS = ("/login", "/website-login")
 _LOGIN_MODAL_SELECTORS = (
     'div[data-testid="login-modal"]',
     '.login-container',
@@ -49,11 +48,8 @@ _LOGIN_MODAL_SELECTORS = (
 _SCROLL_STEPS_PER_ROUND = 4
 # Maximum number of scroll rounds before giving up
 _MAX_SCROLL_ROUNDS = 10
-# How many candidates to fetch from the web per keyword on a cache miss.
-# Surplus beyond what the caller needs is stored in the cache for future runs.
-_CACHE_POOL_SIZE = 50
-# Directory that holds per-keyword candidate caches (pickle files)
-_CACHE_DIR = Path(__file__).parents[2] / "staging" / "xhs_cache"
+# Persists per-keyword scroll offsets across runs
+_OFFSET_FILE = Path(__file__).parents[2] / "staging" / "xhs_offsets.json"
 
 
 # ---------------------------------------------------------------------------
@@ -152,34 +148,23 @@ async def _assert_not_login_wall(page: Page) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Keyword candidate cache
+# Keyword scroll-offset persistence
 # ---------------------------------------------------------------------------
 
 
-def _cache_path(keyword: str) -> Path:
-    slug = hashlib.md5(keyword.encode()).hexdigest()[:16]
-    return _CACHE_DIR / f"{slug}.pkl"
-
-
-def _load_candidate_cache(keyword: str) -> list[PostCandidate]:
-    """Load cached candidates for *keyword*. Returns [] on any error."""
+def _load_offsets() -> dict[str, int]:
     try:
-        return pickle.loads(_cache_path(keyword).read_bytes())
+        return json.loads(_OFFSET_FILE.read_text())
     except Exception:
-        return []
+        return {}
 
 
-def _save_candidate_cache(keyword: str, candidates: list[PostCandidate]) -> None:
-    """Persist *candidates* as the cache for *keyword*. Deletes the file if empty."""
-    path = _cache_path(keyword)
-    if not candidates:
-        path.unlink(missing_ok=True)
-        return
+def _save_offsets(offsets: dict[str, int]) -> None:
     try:
-        _CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(pickle.dumps(candidates))
+        _OFFSET_FILE.parent.mkdir(parents=True, exist_ok=True)
+        _OFFSET_FILE.write_text(json.dumps(offsets))
     except Exception as exc:
-        logger.debug("XHS cache write failed for %r: %s", keyword, exc)
+        logger.debug("XHS offset save failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -188,106 +173,91 @@ def _save_candidate_cache(keyword: str, candidates: list[PostCandidate]) -> None
 
 
 async def _fetch_keyword_from_web(
-    page: Page, keyword: str, pool_size: int, *, skip_urls: set[str] | None = None
-) -> list[PostCandidate]:
-    """Scrape XHS for *keyword*, returning up to *pool_size* fresh candidates.
+    page: Page,
+    keyword: str,
+    pool_size: int,
+    *,
+    start_offset: int = 0,
+    skip_urls: set[str] | None = None,
+) -> tuple[list[PostCandidate], int]:
+    """Scrape XHS for *keyword*, resuming from *start_offset* cards.
 
-    Each scroll round reveals new cards; only newly visible cards are harvested.
-    Stops early once *pool_size* candidates are collected or the page is exhausted.
+    Pre-scrolls past already-processed cards, then harvests new ones.
+    Returns (candidates, new_processed_offset).
     """
     url = f"{_BASE}/search_result?keyword={quote('#' + keyword.lstrip('#'))}&type=51"
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-        await page.wait_for_timeout(2_000)
+        await page.wait_for_timeout(5_000)
     except Exception as exc:
         logger.warning("XHS keyword navigation failed: %s", exc)
-        return []
+        return [], start_offset
 
     await _assert_not_login_wall(page)
 
     cookies = await page.context.cookies()
     cookie_header = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
 
-    candidates: list[PostCandidate] = []
-    processed_offset = 0
     seen_urls: set[str] = set(skip_urls or [])
+    candidates: list[PostCandidate] = []
+    raw_offset = 0
+    prev_card_count = 0
+
+    # Pre-scroll until the raw DOM card count reaches start_offset
+    if start_offset > 0:
+        logger.info("XHS keyword %r: pre-scrolling to raw offset %d", keyword, start_offset)
+        while raw_offset < start_offset:
+            prev_raw = raw_offset
+            await _scroll_until_new_cards(page, raw_offset)
+            raw_offset = await _count_raw_cards(page)
+            if raw_offset == prev_raw:
+                break  # page stopped loading
+        prev_card_count = len(await _collect_all_cards(page))
+        logger.info("XHS keyword %r: pre-scroll done, raw=%d (target %d)", keyword, raw_offset, start_offset)
 
     for scroll_round in range(1, _MAX_SCROLL_ROUNDS + 1):
-        await _scroll_down(page, steps=_SCROLL_STEPS_PER_ROUND)
+        await _scroll_until_new_cards(page, raw_offset)
+        raw_offset = await _count_raw_cards(page)
 
         all_cards = await _collect_all_cards(page)
-        new_cards = all_cards[processed_offset:]
+        new_cards = all_cards[prev_card_count:]
+        prev_card_count = len(all_cards)
 
-        if not new_cards:
-            logger.debug("XHS keyword round %d: no new cards appeared; stopping.", scroll_round)
-            break
+        if new_cards and len(candidates) < pool_size:
+            batch_candidates = await _harvest_cards(
+                new_cards, page, url, cookie_header, pool_size - len(candidates),
+                from_creator=False, skip_urls=seen_urls,
+            )
+            for c in batch_candidates:
+                seen_urls.add(c.source_url)
+            candidates.extend(batch_candidates)
 
-        logger.debug(
-            "XHS keyword round %d: %d total cards, %d new (offset %d).",
-            scroll_round, len(all_cards), len(new_cards), processed_offset,
-        )
-        processed_offset = len(all_cards)
-
-        batch_candidates = await _harvest_cards(
-            new_cards, page, url, cookie_header, pool_size - len(candidates),
-            from_creator=False, skip_urls=seen_urls,
-        )
-        for c in batch_candidates:
-            seen_urls.add(c.source_url)
-        candidates.extend(batch_candidates)
-
-        logger.debug(
-            "XHS keyword round %d: +%d fresh posts; total %d/%d.",
-            scroll_round, len(batch_candidates), len(candidates), pool_size,
+        logger.info(
+            "XHS keyword round %d: raw=%d new=%d harvested=%d.",
+            scroll_round, raw_offset, len(new_cards), len(candidates),
         )
 
         if len(candidates) >= pool_size:
-            logger.debug("XHS keyword: filled %d slots after %d round(s).", pool_size, scroll_round)
             break
 
-    return candidates
+    return candidates, raw_offset
 
 
 async def _scrape_keyword(
     page: Page, keyword: str, limit: int, *, skip_urls: set[str] | None = None
 ) -> list[PostCandidate]:
-    """Return up to *limit* fresh candidates for *keyword*, using the cache when possible.
+    """Fetch up to *limit* fresh candidates for *keyword*, resuming from the saved scroll offset."""
+    offsets = _load_offsets()
+    start_offset = offsets.get(keyword, 0)
 
-    Cache hit:  serves from the stored pool without touching the browser.
-    Cache miss: fetches _CACHE_POOL_SIZE candidates from the web, returns *limit*,
-                and stores the surplus so future calls are served from cache.
-    """
-    skip = set(skip_urls or [])
-
-    # --- Try cache first ---
-    cached = _load_candidate_cache(keyword)
-    fresh_cached = [c for c in cached if c.source_url not in skip]
-
-    if len(fresh_cached) >= limit:
-        to_serve = fresh_cached[:limit]
-        served = {c.source_url for c in to_serve}
-        _save_candidate_cache(keyword, [c for c in cached if c.source_url not in served])
-        logger.info(
-            "XHS cache hit for %r: serving %d, %d remaining in cache.",
-            keyword, limit, len(fresh_cached) - limit,
-        )
-        return to_serve
-
-    # --- Cache miss / partial — fetch from web ---
-    # Exclude already-cached URLs from skip so we don't re-scrape them
-    web_skip = skip | {c.source_url for c in fresh_cached}
-    scraped = await _fetch_keyword_from_web(page, keyword, _CACHE_POOL_SIZE, skip_urls=web_skip)
-
-    combined = fresh_cached + scraped
-    to_serve = combined[:limit]
-    surplus = combined[limit:]
-    _save_candidate_cache(keyword, surplus)
-
-    logger.info(
-        "XHS cache miss for %r: scraped %d from web, serving %d, cached %d surplus.",
-        keyword, len(scraped), len(to_serve), len(surplus),
+    candidates, new_offset = await _fetch_keyword_from_web(
+        page, keyword, limit, start_offset=start_offset, skip_urls=skip_urls
     )
-    return to_serve
+
+    offsets[keyword] = new_offset
+    _save_offsets(offsets)
+    logger.info("XHS keyword %r: fetched %d posts, offset %d → %d", keyword, len(candidates), start_offset, offsets[keyword])
+    return candidates
 
 
 # ---------------------------------------------------------------------------
@@ -317,7 +287,7 @@ async def _scrape_creator(
     seen_urls: set[str] = set(skip_urls or [])
 
     for scroll_round in range(1, _MAX_SCROLL_ROUNDS + 1):
-        await _scroll_down(page, steps=_SCROLL_STEPS_PER_ROUND)
+        await _scroll_until_new_cards(page, processed_offset)
 
         all_cards = await _collect_all_cards(page)
         new_cards = all_cards[processed_offset:]
@@ -357,12 +327,19 @@ async def _scrape_creator(
 # ---------------------------------------------------------------------------
 
 
-async def _scroll_down(page: Page, steps: int = _SCROLL_STEPS_PER_ROUND) -> None:
-    """Scroll down by *steps* increments to trigger lazy-loading of new cards."""
-    for _ in range(steps):
+async def _count_raw_cards(page: Page) -> int:
+    """Return the raw number of section.note-item elements in the DOM (no dedup)."""
+    return len(await page.query_selector_all("section.note-item"))
+
+
+async def _scroll_until_new_cards(page: Page, current_count: int, max_attempts: int = 20) -> None:
+    """Scroll down until the DOM has more cards than *current_count*, or give up after *max_attempts*."""
+    for _ in range(max_attempts):
         await page.evaluate("window.scrollBy(0, 800)")
         await page.wait_for_timeout(500)
-    # Brief pause for JS rendering after the final scroll
+        cards = await _collect_all_cards(page)
+        if len(cards) > current_count:
+            return
     await page.wait_for_timeout(300)
 
 

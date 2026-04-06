@@ -131,9 +131,9 @@ async def run_scrape(force: bool = False) -> None:
         if mode == RunMode.keyword:
             logger.info("Starting Xiaohongshu scrape (keyword=%r)", keyword)
             results = await scrape_xiaohongshu(
-                keyword=keyword,
+                keywords=[keyword] if keyword else [],
                 creator_handles=[],
-                max_results=_PER_PLATFORM * 10,
+                max_results=_FETCH_LIMIT,
                 skip_urls=seen_urls,
             )
             xhs_candidates = _weighted_sample(results, _PER_PLATFORM)
@@ -238,14 +238,20 @@ def _init_daily_run(today: dt.date, force: bool = False) -> str | None:
 
 def _get_top_creator(platform: Platform) -> str | None:
     """Return the handle of the most-liked creator for the given platform, or None."""
+    creators = _get_top_creators(1, platform)
+    return creators[0] if creators else None
+
+
+def _get_top_creators(n: int, platform: Platform) -> list[str]:
+    """Return the top-n creator handles for the given platform, ranked by liked_count."""
     with Session(engine) as session:
-        creator = session.exec(
+        creators = session.exec(
             select(Creator)
             .where(Creator.platform == platform)
             .order_by(Creator.liked_count.desc())
-            .limit(1)
-        ).first()
-        return creator.handle if creator else None
+            .limit(n)
+        ).all()
+        return [c.handle for c in creators]
 
 
 def _get_top_tags(n: int, platform: Platform) -> list[str]:
@@ -269,79 +275,127 @@ def _get_top_tags(n: int, platform: Platform) -> list[str]:
 
 
 
-async def _discover_instagram(seen_urls: set[str]) -> list[PostCandidate]:
-    """Discovery-mode Instagram scrape: 1-2 posts from the most-liked creator,
-    then fill remaining slots from the top 3 hashtags shared across liked posts.
-    Returns an empty list if no creators or tags have been recorded yet.
-    """
-    top_creator = _get_top_creator(Platform.instagram)
-    top_tags = _get_top_tags(3, Platform.instagram)
+def _discovery_slots() -> tuple[int, int, int, int]:
+    """Return (tag1, tag2, tag3, creator) slot counts for discovery mode.
 
+    Budget: 60% tag1 · 20% tag2 · 10% tag3 · 10% creator.
+    With _PER_PLATFORM=5 → (3, 1, 0, 1).
+    """
+    tag1 = math.floor(0.6 * _PER_PLATFORM)
+    tag2 = math.floor(0.2 * _PER_PLATFORM)
+    creator = math.ceil(0.1 * _PER_PLATFORM)
+    tag3 = max(_PER_PLATFORM - tag1 - tag2 - creator, 0)
+    return tag1, tag2, tag3, creator
+
+
+async def _discover_instagram(seen_urls: set[str]) -> list[PostCandidate]:
+    """Discovery-mode Instagram scrape with fixed per-source budgets.
+
+    Slots (60/20/10/10 split): tag1 gets most posts, then tag2, tag3, top creator.
+    Falls back to extra tags then extra creators if the total is still short.
+    """
+    all_creators = _get_top_creators(5, Platform.instagram)
+    all_tags = _get_top_tags(10, Platform.instagram)
+
+    if not all_creators and not all_tags:
+        logger.info("IG discovery: no creators or tags yet — skipping.")
+        return []
+
+    s_tag1, s_tag2, s_tag3, s_creator = _discovery_slots()
     candidates: list[PostCandidate] = []
     local_seen = set(seen_urls)
 
-    # 1-2 posts from top liked creator
-    if top_creator:
-        results = await _scrape_instagram(
-            keyword=None,
-            creator_handles=[top_creator],
-            max_results=_FETCH_LIMIT,
-            skip_urls=local_seen,
-        )
-        picks = _weighted_sample(results, 2)
+    # Primary allocation — each source gets its fixed budget
+    primary: list[tuple[str, str | None, int]] = [
+        ("tag",     all_tags[0]     if len(all_tags) > 0     else None, s_tag1),
+        ("tag",     all_tags[1]     if len(all_tags) > 1     else None, s_tag2),
+        ("tag",     all_tags[2]     if len(all_tags) > 2     else None, s_tag3),
+        ("creator", all_creators[0] if len(all_creators) > 0 else None, s_creator),
+    ]
+    for kind, source, budget in primary:
+        if not source or budget <= 0:
+            continue
+        if kind == "tag":
+            results = await _scrape_instagram(
+                keyword=source, creator_handles=[], max_results=_FETCH_LIMIT, skip_urls=local_seen,
+            )
+        else:
+            results = await _scrape_instagram(
+                keyword=None, creator_handles=[source], max_results=_FETCH_LIMIT, skip_urls=local_seen,
+            )
+        picks = _weighted_sample([c for c in results if c.source_url not in local_seen], budget)
         candidates.extend(picks)
         local_seen.update(c.source_url for c in picks)
-        logger.info("IG discovery: %d post(s) from top creator @%s", len(picks), top_creator)
+        logger.info("IG discovery: %d/%d post(s) from %s %r", len(picks), budget, kind, source)
 
-    # Fill remaining slots with top 3 tags (distributed evenly)
-    if top_tags:
-        for i, tag in enumerate(top_tags):
-            if len(candidates) >= _PER_PLATFORM:
-                break
-            slots_left = _PER_PLATFORM - len(candidates)
-            tags_left = len(top_tags) - i
-            per_tag = math.ceil(slots_left / tags_left)
+    # Fallback: fill any remaining slots from extra tags then extra creators
+    fallback_sources: list[tuple[str, str]] = (
+        [("tag", t) for t in all_tags[3:]]
+        + [("creator", h) for h in all_creators[1:]]
+    )
+    for kind, source in fallback_sources:
+        if len(candidates) >= _PER_PLATFORM:
+            break
+        slots_left = _PER_PLATFORM - len(candidates)
+        if kind == "tag":
             results = await _scrape_instagram(
-                keyword=tag,
-                creator_handles=[],
-                max_results=_FETCH_LIMIT,
-                skip_urls=local_seen,
+                keyword=source, creator_handles=[], max_results=_FETCH_LIMIT, skip_urls=local_seen,
             )
-            picks = _weighted_sample(results, per_tag)
-            candidates.extend(picks)
-            local_seen.update(c.source_url for c in picks)
-            logger.info("IG discovery: %d post(s) from tag #%s", len(picks), tag)
+        else:
+            results = await _scrape_instagram(
+                keyword=None, creator_handles=[source], max_results=_FETCH_LIMIT, skip_urls=local_seen,
+            )
+        picks = _weighted_sample([c for c in results if c.source_url not in local_seen], slots_left)
+        candidates.extend(picks)
+        local_seen.update(c.source_url for c in picks)
+        if picks:
+            logger.info("IG fallback: %d post(s) from %s %r", len(picks), kind, source)
 
     return candidates
 
 
 async def _discover_xhs(seen_urls: set[str]) -> list[PostCandidate]:
-    """Discovery-mode Xiaohongshu scrape: top liked creator + top hashtag in one browser session.
+    """Discovery-mode Xiaohongshu scrape.
 
-    XHS launches a full browser per call, so we combine creator profile and keyword
-    into a single call. Returns an empty list if no creators or tags exist yet.
+    Assembles a _FETCH_LIMIT-post pool with fixed percentage allocation:
+      60% tag #1 · 20% tag #2 · 10% tag #3 · 10% top creator
+    e.g. with _FETCH_LIMIT=50: 30 + 10 + 5 + 5 posts.
+
+    Each source is served from its per-keyword pickle cache when possible;
+    the browser only runs for cache misses.  Then _weighted_sample picks
+    _PER_PLATFORM posts from the combined pool.
     """
-    top_creator = _get_top_creator(Platform.xiaohongshu)
-    top_tags = _get_top_tags(3, Platform.xiaohongshu)
+    all_creators = _get_top_creators(3, Platform.xiaohongshu)
+    all_tags = _get_top_tags(6, Platform.xiaohongshu)
 
-    keyword = top_tags[0] if top_tags else None
-    creator_handles = [top_creator] if top_creator else []
-
-    if not keyword and not creator_handles:
+    if not all_creators and not all_tags:
         logger.info("XHS discovery: no creators or tags yet — skipping.")
         return []
 
+    pool_tag1    = round(_FETCH_LIMIT * 0.60)  # 30
+    pool_tag2    = round(_FETCH_LIMIT * 0.20)  # 10
+    pool_tag3    = round(_FETCH_LIMIT * 0.10)  # 5
+    pool_creator = _FETCH_LIMIT - pool_tag1 - pool_tag2 - pool_tag3  # 5
+
+    tags     = all_tags[:3]
+    creators = all_creators[:1]
+
     logger.info(
-        "XHS discovery: keyword=%r, creator=%r",
-        keyword, top_creator,
+        "XHS discovery: tags=%s creator=%s pool_budget=(tag1=%d tag2=%d tag3=%d creator=%d)",
+        tags, creators, pool_tag1, pool_tag2, pool_tag3, pool_creator,
     )
-    results = await scrape_xiaohongshu(
-        keyword=keyword,
-        creator_handles=creator_handles,
-        max_results=_PER_PLATFORM * 10,
+
+    pool = await scrape_xiaohongshu(
+        keywords=tags,
+        creator_handles=creators,
+        keyword_limits=[pool_tag1, pool_tag2, pool_tag3][: len(tags)],
+        creator_limits=[pool_creator][: len(creators)],
+        max_results=_FETCH_LIMIT,
         skip_urls=seen_urls,
     )
-    return _weighted_sample(results, _PER_PLATFORM)
+
+    logger.info("XHS discovery: pool of %d posts → sampling %d", len(pool), _PER_PLATFORM)
+    return _weighted_sample(pool, _PER_PLATFORM)
 
 
 def _init_platform_run(run_id: str, platform: Platform) -> str:

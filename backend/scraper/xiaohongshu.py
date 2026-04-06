@@ -19,9 +19,12 @@ Raises SessionExpiredError if a login wall is detected.
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import pickle
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 from urllib.parse import quote, urlparse
 
@@ -46,6 +49,11 @@ _LOGIN_MODAL_SELECTORS = (
 _SCROLL_STEPS_PER_ROUND = 4
 # Maximum number of scroll rounds before giving up
 _MAX_SCROLL_ROUNDS = 10
+# How many candidates to fetch from the web per keyword on a cache miss.
+# Surplus beyond what the caller needs is stored in the cache for future runs.
+_CACHE_POOL_SIZE = 50
+# Directory that holds per-keyword candidate caches (pickle files)
+_CACHE_DIR = Path(__file__).parents[2] / "staging" / "xhs_cache"
 
 
 # ---------------------------------------------------------------------------
@@ -54,17 +62,27 @@ _MAX_SCROLL_ROUNDS = 10
 
 
 async def scrape_xiaohongshu(
-    keyword: str | None,
+    keywords: list[str],
     creator_handles: list[str],
     max_results: int = 10,
     skip_urls: set[str] | None = None,
+    keyword_limits: list[int] | None = None,
+    creator_limits: list[int] | None = None,
 ) -> list[PostCandidate]:
     """Scrape Xiaohongshu and return up to *max_results* fresh candidates.
 
+    Runs all keyword searches and creator profile scrapes in a single browser
+    session to avoid the overhead of launching multiple browsers.
+
     Args:
-        skip_urls: Source URLs already seen in the DB. The scraper scrolls to
-                   later batches of posts when earlier ones are all duplicates,
-                   mirroring a paginated "next page" approach.
+        keywords: List of hashtags/keywords to search.
+        creator_handles: List of creator handles to scrape.
+        max_results: Global cap when keyword_limits/creator_limits are not set.
+        skip_urls: Source URLs already seen in the DB — skipped during collection.
+        keyword_limits: Per-keyword fetch budget. When provided, each keyword[i]
+                        fetches exactly keyword_limits[i] posts (ignores max_results
+                        cap for that keyword). Skips the keyword when limit is 0.
+        creator_limits: Per-creator fetch budget, same semantics as keyword_limits.
 
     Raises:
         SessionExpiredError: login wall detected during scraping.
@@ -78,16 +96,28 @@ async def scrape_xiaohongshu(
             page = await context.new_page()
             page.set_default_timeout(20_000)
 
-            if keyword:
-                found = await _scrape_keyword(page, keyword, max_results, skip_urls=skip_urls)
+            for i, keyword in enumerate(keywords):
+                if keyword_limits is not None:
+                    limit = keyword_limits[i] if i < len(keyword_limits) else 0
+                else:
+                    if len(candidates) >= max_results:
+                        break
+                    limit = max_results - len(candidates)
+                if limit <= 0:
+                    continue
+                found = await _scrape_keyword(page, keyword, limit, skip_urls=skip_urls)
                 candidates.extend(found)
 
-            for handle in creator_handles:
-                if len(candidates) >= max_results:
-                    break
-                found = await _scrape_creator(
-                    page, handle, max_results - len(candidates), skip_urls=skip_urls
-                )
+            for i, handle in enumerate(creator_handles):
+                if creator_limits is not None:
+                    limit = creator_limits[i] if i < len(creator_limits) else 0
+                else:
+                    if len(candidates) >= max_results:
+                        break
+                    limit = max_results - len(candidates)
+                if limit <= 0:
+                    continue
+                found = await _scrape_creator(page, handle, limit, skip_urls=skip_urls)
                 candidates.extend(found)
 
         finally:
@@ -122,19 +152,50 @@ async def _assert_not_login_wall(page: Page) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Keyword candidate cache
+# ---------------------------------------------------------------------------
+
+
+def _cache_path(keyword: str) -> Path:
+    slug = hashlib.md5(keyword.encode()).hexdigest()[:16]
+    return _CACHE_DIR / f"{slug}.pkl"
+
+
+def _load_candidate_cache(keyword: str) -> list[PostCandidate]:
+    """Load cached candidates for *keyword*. Returns [] on any error."""
+    try:
+        return pickle.loads(_cache_path(keyword).read_bytes())
+    except Exception:
+        return []
+
+
+def _save_candidate_cache(keyword: str, candidates: list[PostCandidate]) -> None:
+    """Persist *candidates* as the cache for *keyword*. Deletes the file if empty."""
+    path = _cache_path(keyword)
+    if not candidates:
+        path.unlink(missing_ok=True)
+        return
+    try:
+        _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(pickle.dumps(candidates))
+    except Exception as exc:
+        logger.debug("XHS cache write failed for %r: %s", keyword, exc)
+
+
+# ---------------------------------------------------------------------------
 # Keyword scrape
 # ---------------------------------------------------------------------------
 
 
-async def _scrape_keyword(
-    page: Page, keyword: str, limit: int, *, skip_urls: set[str] | None = None
+async def _fetch_keyword_from_web(
+    page: Page, keyword: str, pool_size: int, *, skip_urls: set[str] | None = None
 ) -> list[PostCandidate]:
-    """Scrape a keyword search, paging through batches of cards by scrolling.
+    """Scrape XHS for *keyword*, returning up to *pool_size* fresh candidates.
 
-    Each round scrolls deeper and harvests only the *new* cards that have
-    appeared since the previous round (offset-based batching).
+    Each scroll round reveals new cards; only newly visible cards are harvested.
+    Stops early once *pool_size* candidates are collected or the page is exhausted.
     """
-    url = f"{_BASE}/search_result?keyword={quote(keyword)}&type=51"
+    url = f"{_BASE}/search_result?keyword={quote('#' + keyword.lstrip('#'))}&type=51"
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
         await page.wait_for_timeout(2_000)
@@ -144,16 +205,14 @@ async def _scrape_keyword(
 
     await _assert_not_login_wall(page)
 
-    # Grab cookies once for the whole harvest session
     cookies = await page.context.cookies()
     cookie_header = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
 
     candidates: list[PostCandidate] = []
-    processed_offset = 0  # how many cards we've already attempted to harvest
+    processed_offset = 0
     seen_urls: set[str] = set(skip_urls or [])
 
     for scroll_round in range(1, _MAX_SCROLL_ROUNDS + 1):
-        # Scroll down to reveal the next batch of cards
         await _scroll_down(page, steps=_SCROLL_STEPS_PER_ROUND)
 
         all_cards = await _collect_all_cards(page)
@@ -169,9 +228,8 @@ async def _scrape_keyword(
         )
         processed_offset = len(all_cards)
 
-        # Harvest the new batch (visits each note page, then returns to listing)
         batch_candidates = await _harvest_cards(
-            new_cards, page, url, cookie_header, limit - len(candidates),
+            new_cards, page, url, cookie_header, pool_size - len(candidates),
             from_creator=False, skip_urls=seen_urls,
         )
         for c in batch_candidates:
@@ -180,14 +238,56 @@ async def _scrape_keyword(
 
         logger.debug(
             "XHS keyword round %d: +%d fresh posts; total %d/%d.",
-            scroll_round, len(batch_candidates), len(candidates), limit,
+            scroll_round, len(batch_candidates), len(candidates), pool_size,
         )
 
-        if len(candidates) >= limit:
-            logger.debug("XHS keyword: filled %d slots after %d round(s).", limit, scroll_round)
+        if len(candidates) >= pool_size:
+            logger.debug("XHS keyword: filled %d slots after %d round(s).", pool_size, scroll_round)
             break
 
     return candidates
+
+
+async def _scrape_keyword(
+    page: Page, keyword: str, limit: int, *, skip_urls: set[str] | None = None
+) -> list[PostCandidate]:
+    """Return up to *limit* fresh candidates for *keyword*, using the cache when possible.
+
+    Cache hit:  serves from the stored pool without touching the browser.
+    Cache miss: fetches _CACHE_POOL_SIZE candidates from the web, returns *limit*,
+                and stores the surplus so future calls are served from cache.
+    """
+    skip = set(skip_urls or [])
+
+    # --- Try cache first ---
+    cached = _load_candidate_cache(keyword)
+    fresh_cached = [c for c in cached if c.source_url not in skip]
+
+    if len(fresh_cached) >= limit:
+        to_serve = fresh_cached[:limit]
+        served = {c.source_url for c in to_serve}
+        _save_candidate_cache(keyword, [c for c in cached if c.source_url not in served])
+        logger.info(
+            "XHS cache hit for %r: serving %d, %d remaining in cache.",
+            keyword, limit, len(fresh_cached) - limit,
+        )
+        return to_serve
+
+    # --- Cache miss / partial — fetch from web ---
+    # Exclude already-cached URLs from skip so we don't re-scrape them
+    web_skip = skip | {c.source_url for c in fresh_cached}
+    scraped = await _fetch_keyword_from_web(page, keyword, _CACHE_POOL_SIZE, skip_urls=web_skip)
+
+    combined = fresh_cached + scraped
+    to_serve = combined[:limit]
+    surplus = combined[limit:]
+    _save_candidate_cache(keyword, surplus)
+
+    logger.info(
+        "XHS cache miss for %r: scraped %d from web, serving %d, cached %d surplus.",
+        keyword, len(scraped), len(to_serve), len(surplus),
+    )
+    return to_serve
 
 
 # ---------------------------------------------------------------------------

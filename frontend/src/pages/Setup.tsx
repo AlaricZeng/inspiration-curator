@@ -168,31 +168,30 @@ export default function Setup() {
                   <span style={styles.platformLabel}>小红书 (Xiaohongshu)</span>
                   <StatusBadge authenticated={authenticated} connecting={false} />
                 </div>
-                {!authenticated && (
-                  <div style={styles.cookieBox}>
-                    <p style={styles.cookieHint}>
-                      Install{" "}
-                      <a href="https://chromewebstore.google.com/detail/cookie-editor/hlkenndednhfkekhgcdicdfddnkalmdm" target="_blank" rel="noreferrer" style={styles.link}>
-                        Cookie-Editor
-                      </a>
-                      , log in to xiaohongshu.com, then click <strong>Export → Export as JSON</strong> and paste below.
-                    </p>
-                    <textarea
-                      style={styles.textarea}
-                      placeholder='[{"name":"web_session","value":"..."}]'
-                      rows={4}
-                      value={xhsCookieText}
-                      onChange={(e) => setXhsCookieText(e.target.value)}
-                    />
-                    <button
-                      style={{ ...styles.button, ...(importingCookies || !xhsCookieText.trim() ? styles.buttonDisabled : {}) }}
-                      disabled={importingCookies || !xhsCookieText.trim()}
-                      onClick={() => void handleImportCookies()}
-                    >
-                      {importingCookies ? "Importing…" : "Import Cookies"}
-                    </button>
-                  </div>
-                )}
+                <div style={styles.cookieBox}>
+                  <p style={styles.cookieHint}>
+                    Install{" "}
+                    <a href="https://chromewebstore.google.com/detail/cookie-editor/hlkenndednhfkekhgcdicdfddnkalmdm" target="_blank" rel="noreferrer" style={styles.link}>
+                      Cookie-Editor
+                    </a>
+                    , log in to xiaohongshu.com, then click <strong>Export → Export as JSON</strong> and paste below.
+                    {authenticated && " Paste new cookies to re-authenticate."}
+                  </p>
+                  <textarea
+                    style={styles.textarea}
+                    placeholder='[{"name":"web_session","value":"..."}]'
+                    rows={4}
+                    value={xhsCookieText}
+                    onChange={(e) => setXhsCookieText(e.target.value)}
+                  />
+                  <button
+                    style={{ ...styles.button, ...(importingCookies || !xhsCookieText.trim() ? styles.buttonDisabled : {}) }}
+                    disabled={importingCookies || !xhsCookieText.trim()}
+                    onClick={() => void handleImportCookies()}
+                  >
+                    {importingCookies ? "Importing…" : authenticated ? "Re-authenticate" : "Import Cookies"}
+                  </button>
+                </div>
               </div>
             );
           })()}

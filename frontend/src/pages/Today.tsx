@@ -68,6 +68,13 @@ export default function Today() {
     void checkSeedNeeded();
   }, [load, checkSeedNeeded]);
 
+  // Refetch when the user returns to this tab (e.g. after curating some posts)
+  useEffect(() => {
+    const onVisible = () => { if (document.visibilityState === "visible") void load(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => document.removeEventListener("visibilitychange", onVisible);
+  }, [load]);
+
   // Poll every 10s while status is "running"
   useEffect(() => {
     const isRunning = data?.status === "running";
@@ -211,7 +218,7 @@ export default function Today() {
 
             {showEarlyCurate && (
               <Link to="/curate" style={{ ...s.btn, ...s.btnAccent, textDecoration: "none" }}>
-                Curate now — {(data!.instagram?.post_count ?? 0) + (data!.xiaohongshu?.post_count ?? 0)} posts ready
+                Curate now — {data!.pending_count} posts ready
               </Link>
             )}
 

@@ -19,11 +19,9 @@ Raises SessionExpiredError if a login wall is detected.
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Optional
 from urllib.parse import quote, urlparse
 
@@ -48,8 +46,6 @@ _LOGIN_MODAL_SELECTORS = (
 _SCROLL_STEPS_PER_ROUND = 4
 # Maximum number of scroll rounds before giving up
 _MAX_SCROLL_ROUNDS = 10
-# Persists per-keyword scroll offsets across runs
-_OFFSET_FILE = Path(__file__).parents[2] / "staging" / "xhs_offsets.json"
 
 
 # ---------------------------------------------------------------------------
@@ -148,42 +144,18 @@ async def _assert_not_login_wall(page: Page) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Keyword scroll-offset persistence
-# ---------------------------------------------------------------------------
-
-
-def _load_offsets() -> dict[str, int]:
-    try:
-        return json.loads(_OFFSET_FILE.read_text())
-    except Exception:
-        return {}
-
-
-def _save_offsets(offsets: dict[str, int]) -> None:
-    try:
-        _OFFSET_FILE.parent.mkdir(parents=True, exist_ok=True)
-        _OFFSET_FILE.write_text(json.dumps(offsets))
-    except Exception as exc:
-        logger.debug("XHS offset save failed: %s", exc)
-
-
-# ---------------------------------------------------------------------------
 # Keyword scrape
 # ---------------------------------------------------------------------------
 
 
-async def _fetch_keyword_from_web(
-    page: Page,
-    keyword: str,
-    pool_size: int,
-    *,
-    start_offset: int = 0,
-    skip_urls: set[str] | None = None,
-) -> tuple[list[PostCandidate], int]:
-    """Scrape XHS for *keyword*, resuming from *start_offset* cards.
+async def _scrape_keyword(
+    page: Page, keyword: str, limit: int, *, skip_urls: set[str] | None = None
+) -> list[PostCandidate]:
+    """Scrape XHS for *keyword*, returning up to *limit* fresh candidates.
 
-    Pre-scrolls past already-processed cards, then harvests new ones.
-    Returns (candidates, new_processed_offset).
+    Scrolls through the feed harvesting cards not in skip_urls.
+    XHS virtualizes the DOM (~18 cards visible at a time), so deduplication
+    relies entirely on skip_urls rather than positional offsets.
     """
     url = f"{_BASE}/search_result?keyword={quote('#' + keyword.lstrip('#'))}&type=51"
     try:
@@ -191,7 +163,7 @@ async def _fetch_keyword_from_web(
         await page.wait_for_timeout(5_000)
     except Exception as exc:
         logger.warning("XHS keyword navigation failed: %s", exc)
-        return [], start_offset
+        return []
 
     await _assert_not_login_wall(page)
 
@@ -200,32 +172,20 @@ async def _fetch_keyword_from_web(
 
     seen_urls: set[str] = set(skip_urls or [])
     candidates: list[PostCandidate] = []
-    raw_offset = 0
     prev_card_count = 0
 
-    # Pre-scroll until the raw DOM card count reaches start_offset
-    if start_offset > 0:
-        logger.info("XHS keyword %r: pre-scrolling to raw offset %d", keyword, start_offset)
-        while raw_offset < start_offset:
-            prev_raw = raw_offset
-            await _scroll_until_new_cards(page, raw_offset)
-            raw_offset = await _count_raw_cards(page)
-            if raw_offset == prev_raw:
-                break  # page stopped loading
-        prev_card_count = len(await _collect_all_cards(page))
-        logger.info("XHS keyword %r: pre-scroll done, raw=%d (target %d)", keyword, raw_offset, start_offset)
+    all_seen_card_urls: set[str] = set()
 
     for scroll_round in range(1, _MAX_SCROLL_ROUNDS + 1):
-        await _scroll_until_new_cards(page, raw_offset)
-        raw_offset = await _count_raw_cards(page)
+        await _scroll_until_new_cards(page, all_seen_card_urls)
 
         all_cards = await _collect_all_cards(page)
-        new_cards = all_cards[prev_card_count:]
-        prev_card_count = len(all_cards)
+        new_cards = [c for c in all_cards if c.url not in all_seen_card_urls]
+        all_seen_card_urls.update(c.url for c in all_cards)
 
-        if new_cards and len(candidates) < pool_size:
+        if new_cards and len(candidates) < limit:
             batch_candidates = await _harvest_cards(
-                new_cards, page, url, cookie_header, pool_size - len(candidates),
+                new_cards, page, url, cookie_header, limit - len(candidates),
                 from_creator=False, skip_urls=seen_urls,
             )
             for c in batch_candidates:
@@ -233,30 +193,13 @@ async def _fetch_keyword_from_web(
             candidates.extend(batch_candidates)
 
         logger.info(
-            "XHS keyword round %d: raw=%d new=%d harvested=%d.",
-            scroll_round, raw_offset, len(new_cards), len(candidates),
+            "XHS keyword %r round %d: %d new cards, %d harvested total.",
+            keyword, scroll_round, len(new_cards), len(candidates),
         )
 
-        if len(candidates) >= pool_size:
+        if len(candidates) >= limit:
             break
 
-    return candidates, raw_offset
-
-
-async def _scrape_keyword(
-    page: Page, keyword: str, limit: int, *, skip_urls: set[str] | None = None
-) -> list[PostCandidate]:
-    """Fetch up to *limit* fresh candidates for *keyword*, resuming from the saved scroll offset."""
-    offsets = _load_offsets()
-    start_offset = offsets.get(keyword, 0)
-
-    candidates, new_offset = await _fetch_keyword_from_web(
-        page, keyword, limit, start_offset=start_offset, skip_urls=skip_urls
-    )
-
-    offsets[keyword] = new_offset
-    _save_offsets(offsets)
-    logger.info("XHS keyword %r: fetched %d posts, offset %d → %d", keyword, len(candidates), start_offset, offsets[keyword])
     return candidates
 
 
@@ -283,41 +226,24 @@ async def _scrape_creator(
     cookie_header = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
 
     candidates: list[PostCandidate] = []
-    processed_offset = 0
     seen_urls: set[str] = set(skip_urls or [])
+    all_seen_card_urls: set[str] = set()
 
-    for scroll_round in range(1, _MAX_SCROLL_ROUNDS + 1):
-        await _scroll_until_new_cards(page, processed_offset)
+    all_cards = await _collect_all_cards(page)
+    new_cards = [c for c in all_cards if c.url not in all_seen_card_urls]
+    all_seen_card_urls.update(c.url for c in all_cards)
 
-        all_cards = await _collect_all_cards(page)
-        new_cards = all_cards[processed_offset:]
-
-        if not new_cards:
-            logger.debug("XHS creator %s round %d: no new cards; stopping.", handle, scroll_round)
-            break
-
-        logger.debug(
-            "XHS creator %s round %d: %d total cards, %d new (offset %d).",
-            handle, scroll_round, len(all_cards), len(new_cards), processed_offset,
-        )
-        processed_offset = len(all_cards)
-
+    if new_cards:
         batch_candidates = await _harvest_cards(
-            new_cards, page, url, cookie_header, limit - len(candidates),
+            new_cards, page, url, cookie_header, limit,
             from_creator=True, skip_urls=seen_urls,
         )
-        for c in batch_candidates:
-            seen_urls.add(c.source_url)
         candidates.extend(batch_candidates)
 
-        logger.debug(
-            "XHS creator %s round %d: +%d fresh posts; total %d/%d.",
-            handle, scroll_round, len(batch_candidates), len(candidates), limit,
-        )
-
-        if len(candidates) >= limit:
-            logger.debug("XHS creator %s: filled %d slots after %d round(s).", handle, limit, scroll_round)
-            break
+    logger.info(
+        "XHS creator %r: %d new cards, %d harvested.",
+        handle, len(new_cards), len(candidates),
+    )
 
     return candidates
 
@@ -327,18 +253,16 @@ async def _scrape_creator(
 # ---------------------------------------------------------------------------
 
 
-async def _count_raw_cards(page: Page) -> int:
-    """Return the raw number of section.note-item elements in the DOM (no dedup)."""
-    return len(await page.query_selector_all("section.note-item"))
 
-
-async def _scroll_until_new_cards(page: Page, current_count: int, max_attempts: int = 20) -> None:
-    """Scroll down until the DOM has more cards than *current_count*, or give up after *max_attempts*."""
+async def _scroll_until_new_cards(page: Page, known_urls: set[str], max_attempts: int = 20) -> None:
+    """Scroll down until at least one card URL appears that isn't in *known_urls*, or give up."""
     for _ in range(max_attempts):
         await page.evaluate("window.scrollBy(0, 800)")
         await page.wait_for_timeout(500)
-        cards = await _collect_all_cards(page)
-        if len(cards) > current_count:
+        current_urls = {
+            c.url for c in await _collect_all_cards(page)
+        }
+        if current_urls - known_urls:
             return
     await page.wait_for_timeout(300)
 

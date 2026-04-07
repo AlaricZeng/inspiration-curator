@@ -77,13 +77,7 @@ async def scrape_xiaohongshu(
         SessionExpiredError: login wall detected during scraping.
         FileNotFoundError:   no session file — user must authenticate first.
     """
-    # Filter out display names — valid XHS user IDs are ASCII-only (hex/alphanumeric).
-    # Display names containing Chinese characters, spaces, or emoji are invalid profile URLs.
-    valid_handles = [h for h in creator_handles if re.match(r'^[A-Za-z0-9_\-\.]+$', h)]
-    skipped = set(creator_handles) - set(valid_handles)
-    if skipped:
-        logger.info("XHS: skipping %d display-name handles (not real user IDs): %s", len(skipped), skipped)
-
+    valid_handles = creator_handles
     candidates: list[PostCandidate] = []
 
     async with async_playwright() as pw:

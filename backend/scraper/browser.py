@@ -1,15 +1,13 @@
 """Playwright session manager.
 
-Handles saving and loading authenticated browser sessions for Instagram and
-Xiaohongshu. Headful mode is used for initial authentication; headless mode
-is used for all scraping runs.
+Manages browser contexts for scraping Instagram and Xiaohongshu.
+Instagram uses username/password via instaloader; Xiaohongshu authenticates
+via cookie import (POST /api/auth/xiaohongshu/cookies).
 """
 
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
-from typing import AsyncGenerator
 
 from playwright.async_api import BrowserContext, Playwright, async_playwright
 
@@ -29,10 +27,6 @@ PLATFORM_CONFIG: dict[str, dict[str, str]] = {
     "xiaohongshu": {
         "session_file": str(SESSIONS_DIR / "xiaohongshu.json"),
         "user_data_dir": str(SESSIONS_DIR / "xiaohongshu_profile"),
-        "login_url": "https://www.xiaohongshu.com",
-        "logged_in_url_pattern": "https://www.xiaohongshu.com",
-        "logged_in_exclude": "/login",
-        "auth_cookie": "web_session",
     },
 }
 
@@ -101,90 +95,6 @@ def import_cookies(platform: str, cookie_json: list | dict) -> None:
     )
 
 
-async def create_session(platform: str) -> None:
-    """Open a visible browser, wait for the user to log in, then save the session.
-
-    The browser stays open until the platform detects a successful login
-    (URL leaves the login page) or the 5-minute timeout is reached.
-
-    For Xiaohongshu, uses a persistent browser profile so the session lasts longer.
-    """
-    config = PLATFORM_CONFIG[platform]
-    session_file = config["session_file"]
-    use_persistent = "user_data_dir" in config
-
-    async with async_playwright() as pw:
-        if use_persistent:
-            import shutil
-            user_data_dir = Path(config["user_data_dir"])
-            if user_data_dir.exists():
-                shutil.rmtree(user_data_dir)
-            context = await pw.chromium.launch_persistent_context(
-                str(user_data_dir), headless=False
-            )
-        else:
-            browser = await pw.chromium.launch(headless=False)
-            context = await browser.new_context()
-
-        page = await context.new_page()
-        await page.goto(config["login_url"])
-
-        exclude = config["logged_in_exclude"]
-        logged_in_pattern = config["logged_in_url_pattern"]
-
-        auth_cookie = config.get("auth_cookie")  # optional cookie name that must be present
-
-        try:
-            stable_count = 0
-            deadline = 300  # 5 minutes total
-            elapsed = 0
-            while elapsed < deadline:
-                await asyncio.sleep(2)
-                elapsed += 2
-                current_url = page.url
-                is_clean = (
-                    logged_in_pattern in current_url
-                    and exclude not in current_url
-                    and "/challenge/" not in current_url
-                    and "/two_factor" not in current_url
-                )
-                if is_clean and auth_cookie:
-                    # For XHS: web_session for a logged-in user is much longer (>100 chars).
-                    # Guest sessions also have web_session but it's short/empty.
-                    cookies = await context.cookies()
-                    session_val = next(
-                        (c["value"] for c in cookies if c["name"] == auth_cookie), ""
-                    )
-                    is_clean = len(session_val) > 50
-                if is_clean:
-                    stable_count += 1
-                else:
-                    stable_count = 0
-                if stable_count >= 3:
-                    break
-            else:
-                await context.close()
-                raise TimeoutError(
-                    f"Login timed out after 5 minutes for {platform}. Please try again."
-                )
-        except TimeoutError:
-            raise
-        except Exception:
-            await context.close()
-            raise TimeoutError(
-                f"Login timed out after 5 minutes for {platform}. Please try again."
-            )
-
-        if use_persistent:
-            # Profile is auto-saved; also write a JSON marker so session_exists() works
-            # even before the first persistent-context scrape run.
-            await context.storage_state(path=session_file)
-            await context.close()
-        else:
-            await context.storage_state(path=session_file)
-            await context.browser.close()
-
-
 async def get_context(platform: str, pw: Playwright) -> BrowserContext:
     """Return a headless browser context loaded with the saved session.
 
@@ -215,29 +125,25 @@ async def get_context(platform: str, pw: Playwright) -> BrowserContext:
     if not user_data_dir.exists() and not session_file.exists():
         raise FileNotFoundError(
             f"No session found for {platform}. "
-            "Authenticate first via POST /api/auth/{platform}."
+            "Import cookies via POST /api/auth/xiaohongshu/cookies."
         )
 
-    # Check before launch whether this is a first-time seed situation
-    needs_cookie_seed = not user_data_dir.exists() and session_file.exists()
-
     context = await pw.chromium.launch_persistent_context(
-        str(user_data_dir), headless=True
+        str(user_data_dir),
+        channel="chrome",
+        headless=True,
+        args=["--disable-blink-features=AutomationControlled"],
     )
 
-    # First-time seed: inject cookies from JSON into the fresh profile
-    if needs_cookie_seed:
+    # Hide webdriver flag so XHS doesn't detect headless automation
+    await context.add_init_script(
+        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+    )
+
+    # Always inject cookies from the JSON file so freshly imported cookies
+    # are guaranteed to be active — persistent profile state alone is unreliable.
+    if session_file.exists():
         state = _json.loads(session_file.read_text())
         await context.add_cookies(state.get("cookies", []))
 
     return context
-
-
-async def get_browser(platform: str) -> AsyncGenerator[BrowserContext, None]:
-    """Async context manager yielding a headless context with saved session."""
-    async with async_playwright() as pw:
-        context = await get_context(platform, pw)
-        try:
-            yield context
-        finally:
-            await context.close()

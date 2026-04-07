@@ -37,9 +37,6 @@ _BASE = "https://www.xiaohongshu.com"
 _LOGIN_PATH_FRAGMENTS = ("/login", "/website-login")
 _LOGIN_MODAL_SELECTORS = (
     'div[data-testid="login-modal"]',
-    '.login-container',
-    'div.login-popup',
-    'input[placeholder*="手机号"]',
 )
 
 # Each scroll round adds this many scroll steps (each step = 800 px)
@@ -80,6 +77,13 @@ async def scrape_xiaohongshu(
         SessionExpiredError: login wall detected during scraping.
         FileNotFoundError:   no session file — user must authenticate first.
     """
+    # Filter out display names — valid XHS user IDs are ASCII-only (hex/alphanumeric).
+    # Display names containing Chinese characters, spaces, or emoji are invalid profile URLs.
+    valid_handles = [h for h in creator_handles if re.match(r'^[A-Za-z0-9_\-\.]+$', h)]
+    skipped = set(creator_handles) - set(valid_handles)
+    if skipped:
+        logger.info("XHS: skipping %d display-name handles (not real user IDs): %s", len(skipped), skipped)
+
     candidates: list[PostCandidate] = []
 
     async with async_playwright() as pw:
@@ -87,6 +91,16 @@ async def scrape_xiaohongshu(
         try:
             page = await context.new_page()
             page.set_default_timeout(20_000)
+
+            # Warm-up: let XHS set fingerprinting cookies (a1, webId, etc.) before scraping.
+            try:
+                await page.goto(_BASE, wait_until="domcontentloaded", timeout=20_000)
+                await page.wait_for_timeout(2_000)
+                await _assert_not_login_wall(page)
+            except SessionExpiredError:
+                raise
+            except Exception as exc:
+                logger.warning("XHS warm-up navigation failed: %s", exc)
 
             for i, keyword in enumerate(keywords):
                 if keyword_limits is not None:
@@ -99,8 +113,10 @@ async def scrape_xiaohongshu(
                     continue
                 found = await _scrape_keyword(page, keyword, limit, skip_urls=skip_urls)
                 candidates.extend(found)
+                if found:
+                    await page.wait_for_timeout(2_000)
 
-            for i, handle in enumerate(creator_handles):
+            for i, handle in enumerate(valid_handles):
                 if creator_limits is not None:
                     limit = creator_limits[i] if i < len(creator_limits) else 0
                 else:
@@ -313,12 +329,14 @@ async def _collect_all_cards(page: Page) -> list[_NoteCard]:
                     href = await cover_link.get_attribute("href") or ""
                     detail_url = href if href.startswith("http") else f"{_BASE}{href}"
 
-                # Creator display name from the author link text (first line, before the date)
+                # Creator user ID from the author link href (e.g. /user/profile/<hex-id>)
                 creator = ""
                 author_el = await section.query_selector('a.author[href*="/user/profile/"]')
                 if author_el:
-                    text = (await author_el.inner_text()).strip()
-                    creator = text.split("\n")[0].strip()
+                    href = (await author_el.get_attribute("href") or "").strip()
+                    m = re.search(r"/user/profile/([^/?#]+)", href)
+                    if m:
+                        creator = m.group(1)
 
                 # Cover image (exclude avatars)
                 cover_src = ""

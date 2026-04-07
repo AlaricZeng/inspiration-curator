@@ -4,12 +4,12 @@ import asyncio
 import logging
 from typing import Literal, Optional  # noqa: F401 — Optional needed for Pydantic on py39
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 import instaloader as _ig_lib
 
-from backend.scraper.browser import PLATFORM_CONFIG, create_session, import_cookies
+from backend.scraper.browser import PLATFORM_CONFIG, import_cookies
 from backend.scraper.browser import session_exists as xhs_session_exists
 import backend.scraper.instagram_loader as ig_loader
 
@@ -111,27 +111,6 @@ async def auth_instagram(body: InstagramLoginRequest) -> StartAuthResponse:
 async def logout_instagram() -> StartAuthResponse:
     ig_loader.delete_session()
     return StartAuthResponse(started=True, platform="instagram", detail="Session deleted.")
-
-
-async def _run_xhs_login() -> None:
-    _connecting.add("xiaohongshu")
-    try:
-        await create_session("xiaohongshu")
-        _log.info("Xiaohongshu session saved.")
-    except Exception as exc:
-        _log.error("Xiaohongshu login failed: %s", exc, exc_info=True)
-    finally:
-        _connecting.discard("xiaohongshu")
-
-
-@router.post("/xiaohongshu", response_model=StartAuthResponse)
-async def auth_xiaohongshu(background_tasks: BackgroundTasks) -> StartAuthResponse:
-    """Open a browser window for manual Xiaohongshu login."""
-    if "xiaohongshu" in _connecting:
-        return StartAuthResponse(started=False, platform="xiaohongshu", detail="Login already in progress.")
-
-    background_tasks.add_task(_run_xhs_login)
-    return StartAuthResponse(started=True, platform="xiaohongshu")
 
 
 @router.post("/xiaohongshu/cookies", response_model=StartAuthResponse)

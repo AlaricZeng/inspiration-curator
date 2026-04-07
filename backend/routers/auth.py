@@ -147,7 +147,11 @@ async def import_xiaohongshu_cookies(body: CookieImportRequest) -> StartAuthResp
 
 @router.delete("/xiaohongshu", response_model=StartAuthResponse)
 async def logout_xiaohongshu() -> StartAuthResponse:
+    import shutil
     from pathlib import Path
-    session_file = Path(PLATFORM_CONFIG["xiaohongshu"]["session_file"])
-    session_file.unlink(missing_ok=True)
+    config = PLATFORM_CONFIG["xiaohongshu"]
+    Path(config["session_file"]).unlink(missing_ok=True)
+    user_data_dir = Path(config.get("user_data_dir", ""))
+    if user_data_dir.exists():
+        shutil.rmtree(user_data_dir)
     return StartAuthResponse(started=True, platform="xiaohongshu", detail="Session deleted.")

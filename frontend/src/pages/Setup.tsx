@@ -12,28 +12,6 @@ interface AuthStatusResponse {
   xiaohongshu: PlatformStatus;
 }
 
-async function importXhsCookies(rawText: string): Promise<void> {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(rawText);
-  } catch {
-    throw new Error("Invalid JSON — paste the full Cookie-Editor export.");
-  }
-  // Accept both [{...}, ...] and {"cookies": [...]}
-  const cookies = Array.isArray(parsed)
-    ? parsed
-    : (parsed as Record<string, unknown>).cookies;
-  if (!Array.isArray(cookies)) throw new Error("No cookie array found in pasted JSON.");
-  const res = await fetch("/api/auth/xiaohongshu/cookies", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ cookies }),
-  });
-  if (!res.ok) {
-    const data = (await res.json().catch(() => ({}))) as { detail?: string };
-    throw new Error(data.detail ?? "Cookie import failed.");
-  }
-}
 
 async function fetchStatus(): Promise<AuthStatusResponse> {
   const res = await fetch("/api/auth/status");
@@ -49,8 +27,6 @@ async function startAuth(platform: string): Promise<void> {
 export default function Setup() {
   const [status, setStatus] = useState<AuthStatusResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [xhsCookieText, setXhsCookieText] = useState("");
-  const [importingCookies, setImportingCookies] = useState(false);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const loadStatus = useCallback(async () => {
@@ -107,20 +83,6 @@ export default function Setup() {
     }
   };
 
-  const handleImportCookies = async () => {
-    if (!xhsCookieText.trim()) return;
-    setImportingCookies(true);
-    setError(null);
-    try {
-      await importXhsCookies(xhsCookieText);
-      setXhsCookieText("");
-      await loadStatus();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Cookie import failed.");
-    } finally {
-      setImportingCookies(false);
-    }
-  };
 
   return (
     <div style={styles.page}>
@@ -158,40 +120,26 @@ export default function Setup() {
             );
           })()}
 
-          {/* Xiaohongshu row — cookie import instead of browser popup */}
+          {/* Xiaohongshu row */}
           {(() => {
             const ps = status?.xiaohongshu;
             const authenticated = ps?.status === "authenticated";
+            const connecting = ps?.connecting ?? false;
             return (
-              <div key="xiaohongshu" style={{ ...styles.platformRow, flexDirection: "column", alignItems: "stretch", gap: "0.85rem" }}>
+              <div key="xiaohongshu" style={styles.platformRow}>
                 <div style={styles.platformInfo}>
                   <span style={styles.platformLabel}>小红书 (Xiaohongshu)</span>
-                  <StatusBadge authenticated={authenticated} connecting={false} />
+                  <StatusBadge authenticated={authenticated} connecting={connecting} />
                 </div>
-                <div style={styles.cookieBox}>
-                  <p style={styles.cookieHint}>
-                    Install{" "}
-                    <a href="https://chromewebstore.google.com/detail/cookie-editor/hlkenndednhfkekhgcdicdfddnkalmdm" target="_blank" rel="noreferrer" style={styles.link}>
-                      Cookie-Editor
-                    </a>
-                    , log in to xiaohongshu.com, then click <strong>Export → Export as JSON</strong> and paste below.
-                    {authenticated && " Paste new cookies to re-authenticate."}
-                  </p>
-                  <textarea
-                    style={styles.textarea}
-                    placeholder='[{"name":"web_session","value":"..."}]'
-                    rows={4}
-                    value={xhsCookieText}
-                    onChange={(e) => setXhsCookieText(e.target.value)}
-                  />
+                {!authenticated && (
                   <button
-                    style={{ ...styles.button, ...(importingCookies || !xhsCookieText.trim() ? styles.buttonDisabled : {}) }}
-                    disabled={importingCookies || !xhsCookieText.trim()}
-                    onClick={() => void handleImportCookies()}
+                    style={{ ...styles.button, ...(connecting ? styles.buttonDisabled : {}) }}
+                    disabled={connecting}
+                    onClick={() => void handleConnect("xiaohongshu")}
                   >
-                    {importingCookies ? "Importing…" : authenticated ? "Re-authenticate" : "Import Cookies"}
+                    {connecting ? "Browser opening…" : "Connect Xiaohongshu"}
                   </button>
-                </div>
+                )}
               </div>
             );
           })()}

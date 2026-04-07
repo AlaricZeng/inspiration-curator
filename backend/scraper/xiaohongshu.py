@@ -113,7 +113,7 @@ async def scrape_xiaohongshu(
                 candidates.extend(found)
 
         finally:
-            await context.browser.close()
+            await context.close()
 
     candidates.sort(key=lambda c: c.engagement, reverse=True)
     return candidates[:max_results]

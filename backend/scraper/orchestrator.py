@@ -372,27 +372,41 @@ async def _discover_xhs(seen_urls: set[str]) -> list[PostCandidate]:
     pool_random  = round(_PER_PLATFORM * 0.20)  # 1
     pool_creator = _PER_PLATFORM - pool_tag1 - pool_tag2 - pool_tag3 - pool_random  # 1
 
-    tags        = all_tags[:3]
-    random_tag  = random.choice(all_tags[3:]) if len(all_tags) > 3 else None
-    creator     = next((c for c in all_creators if c), None)
-    creators    = [creator] if creator else []
+    tags       = all_tags[:3]
+    random_tag = random.choice(all_tags[3:]) if len(all_tags) > 3 else None
+    creator    = next((c for c in all_creators if c), None)
+
+    # Try creator first — if no new posts, give the quota to tag #1
+    creator_posts: list[PostCandidate] = []
+    if creator and pool_creator > 0:
+        creator_posts = await scrape_xiaohongshu(
+            keywords=[],
+            creator_handles=[creator],
+            creator_limits=[pool_creator],
+            max_results=pool_creator,
+            skip_urls=seen_urls,
+        )
+        if not creator_posts:
+            logger.info("XHS discovery: no new posts from creator %r — giving quota to tag #1", creator)
+            pool_tag1 += pool_creator
 
     keywords       = tags + ([random_tag] if random_tag else [])
     keyword_limits = [pool_tag1, pool_tag2, pool_tag3] + ([pool_random] if random_tag else [])
 
     logger.info(
-        "XHS discovery: tags=%s random_tag=%s creator=%s budget=(tag1=%d tag2=%d tag3=%d random=%d creator=%d)",
-        tags, random_tag, creators, pool_tag1, pool_tag2, pool_tag3, pool_random, pool_creator,
+        "XHS discovery: tags=%s random_tag=%s creator=%s budget=(tag1=%d tag2=%d tag3=%d random=%d creator=%d) creator_posts=%d",
+        tags, random_tag, creator, pool_tag1, pool_tag2, pool_tag3, pool_random, pool_creator, len(creator_posts),
     )
 
-    return await scrape_xiaohongshu(
+    tag_posts = await scrape_xiaohongshu(
         keywords=keywords,
-        creator_handles=creators,
+        creator_handles=[],
         keyword_limits=keyword_limits,
-        creator_limits=[pool_creator][: len(creators)],
-        max_results=_PER_PLATFORM,
-        skip_urls=seen_urls,
+        max_results=_PER_PLATFORM - len(creator_posts),
+        skip_urls=seen_urls | {c.source_url for c in creator_posts},
     )
+
+    return creator_posts + tag_posts
 
 
 def _init_platform_run(run_id: str, platform: Platform) -> str:
@@ -495,10 +509,20 @@ def _invalidate_instagram_session() -> None:
 
 
 def _invalidate_session(platform: str) -> None:
-    """Delete the saved Playwright session file (used for Xiaohongshu)."""
-    session_file = Path(PLATFORM_CONFIG[platform]["session_file"])
+    """Delete the saved session file and persistent profile dir (used for Xiaohongshu)."""
+    import shutil
+    config = PLATFORM_CONFIG[platform]
+    session_file = Path(config["session_file"])
     try:
         session_file.unlink(missing_ok=True)
         logger.info("Deleted session file for %s.", platform)
     except Exception as exc:
         logger.warning("Could not delete session file for %s: %s", platform, exc)
+    if "user_data_dir" in config:
+        user_data_dir = Path(config["user_data_dir"])
+        try:
+            if user_data_dir.exists():
+                shutil.rmtree(user_data_dir)
+                logger.info("Deleted persistent profile for %s.", platform)
+        except Exception as exc:
+            logger.warning("Could not delete profile dir for %s: %s", platform, exc)

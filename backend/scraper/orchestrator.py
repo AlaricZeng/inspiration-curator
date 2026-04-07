@@ -54,8 +54,7 @@ STAGING_DIR = Path(__file__).parents[2] / "staging"
 # Maximum candidates saved per platform per run; 5 per platform = 10 total
 _PER_PLATFORM = 5
 # How many candidates to fetch per platform before dedup + sampling
-# Large pool ensures we can still fill 5 slots even after heavy dedup
-_FETCH_LIMIT = 50
+_FETCH_LIMIT = _PER_PLATFORM * 3  # 15 — small pool for _weighted_sample without over-fetching
 
 
 # ---------------------------------------------------------------------------
@@ -320,11 +319,11 @@ async def _discover_instagram(seen_urls: set[str]) -> list[PostCandidate]:
             continue
         if kind == "tag":
             results = await _scrape_instagram(
-                keyword=source, creator_handles=[], max_results=_FETCH_LIMIT, skip_urls=local_seen,
+                keyword=source, creator_handles=[], max_results=budget * 3, skip_urls=local_seen,
             )
         else:
             results = await _scrape_instagram(
-                keyword=None, creator_handles=[source], max_results=_FETCH_LIMIT, skip_urls=local_seen,
+                keyword=None, creator_handles=[source], max_results=budget * 3, skip_urls=local_seen,
             )
         picks = _weighted_sample([c for c in results if c.source_url not in local_seen], budget)
         candidates.extend(picks)
@@ -337,7 +336,7 @@ async def _discover_instagram(seen_urls: set[str]) -> list[PostCandidate]:
             break
         slots_left = _PER_PLATFORM - len(candidates)
         results = await _scrape_instagram(
-            keyword=None, creator_handles=[handle], max_results=_FETCH_LIMIT, skip_urls=local_seen,
+            keyword=None, creator_handles=[handle], max_results=slots_left * 3, skip_urls=local_seen,
         )
         picks = _weighted_sample([c for c in results if c.source_url not in local_seen], slots_left)
         candidates.extend(picks)
@@ -509,8 +508,14 @@ def _invalidate_instagram_session() -> None:
 
 
 def _invalidate_session(platform: str) -> None:
-    """Delete the saved session file and persistent profile dir (used for Xiaohongshu)."""
-    import shutil
+    """Delete the saved session JSON file for *platform*.
+
+    The persistent browser profile (user_data_dir) is intentionally preserved —
+    it holds fingerprinting cookies (a1, webId, gid) that survive auth expiry.
+    Wiping the profile causes XHS to treat the next run as a fresh bot even
+    with valid auth cookies. The profile is only rebuilt by import_cookies()
+    when the user explicitly imports fresh credentials.
+    """
     config = PLATFORM_CONFIG[platform]
     session_file = Path(config["session_file"])
     try:
@@ -518,11 +523,3 @@ def _invalidate_session(platform: str) -> None:
         logger.info("Deleted session file for %s.", platform)
     except Exception as exc:
         logger.warning("Could not delete session file for %s: %s", platform, exc)
-    if "user_data_dir" in config:
-        user_data_dir = Path(config["user_data_dir"])
-        try:
-            if user_data_dir.exists():
-                shutil.rmtree(user_data_dir)
-                logger.info("Deleted persistent profile for %s.", platform)
-        except Exception as exc:
-            logger.warning("Could not delete profile dir for %s: %s", platform, exc)

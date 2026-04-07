@@ -26,15 +26,15 @@ PLATFORM_CONFIG: dict[str, dict[str, str]] = {
     },
     "xiaohongshu": {
         "session_file": str(SESSIONS_DIR / "xiaohongshu.json"),
-        "user_data_dir": str(SESSIONS_DIR / "xiaohongshu_profile"),
+        "login_url": "https://www.xiaohongshu.com",
+        "logged_in_url_pattern": "https://www.xiaohongshu.com",
+        "logged_in_exclude": "/login",
     },
 }
 
 
 def session_exists(platform: str) -> bool:
     config = PLATFORM_CONFIG[platform]
-    if "user_data_dir" in config and Path(config["user_data_dir"]).exists():
-        return True
     return Path(config["session_file"]).exists()
 
 
@@ -81,14 +81,6 @@ def import_cookies(platform: str, cookie_json: list | dict) -> None:
     session_file = Path(config["session_file"])
     session_file.write_text(_json.dumps(storage_state))
 
-    # If a persistent profile dir exists, remove it so the next get_context()
-    # call rebuilds it with the freshly imported cookies.
-    if "user_data_dir" in config:
-        import shutil
-        user_data_dir = Path(config["user_data_dir"])
-        if user_data_dir.exists():
-            shutil.rmtree(user_data_dir)
-
     import logging
     logging.getLogger(__name__).info(
         "Imported %d cookies for %s → %s", len(pw_cookies), platform, session_file
@@ -104,46 +96,14 @@ async def get_context(platform: str, pw: Playwright) -> BrowserContext:
 
     Raises FileNotFoundError if no session exists for the platform.
     """
-    import json as _json
-
     config = PLATFORM_CONFIG[platform]
     session_file = Path(config["session_file"])
 
-    if "user_data_dir" not in config:
-        # Instagram: plain headless context with storage_state
-        if not session_file.exists():
-            raise FileNotFoundError(
-                f"No session found for {platform}. "
-                "Authenticate first via POST /api/auth/{platform}."
-            )
-        browser = await pw.chromium.launch(headless=True)
-        return await browser.new_context(storage_state=str(session_file))
-
-    # Xiaohongshu: persistent profile
-    user_data_dir = Path(config["user_data_dir"])
-
-    if not user_data_dir.exists() and not session_file.exists():
+    if not session_file.exists():
         raise FileNotFoundError(
             f"No session found for {platform}. "
-            "Import cookies via POST /api/auth/xiaohongshu/cookies."
+            "Authenticate first via POST /api/auth/{platform}."
         )
 
-    context = await pw.chromium.launch_persistent_context(
-        str(user_data_dir),
-        channel="chrome",
-        headless=True,
-        args=["--disable-blink-features=AutomationControlled"],
-    )
-
-    # Hide webdriver flag so XHS doesn't detect headless automation
-    await context.add_init_script(
-        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-    )
-
-    # Always inject cookies from the JSON file so freshly imported cookies
-    # are guaranteed to be active — persistent profile state alone is unreliable.
-    if session_file.exists():
-        state = _json.loads(session_file.read_text())
-        await context.add_cookies(state.get("cookies", []))
-
-    return context
+    browser = await pw.chromium.launch(headless=True)
+    return await browser.new_context(storage_state=str(session_file))

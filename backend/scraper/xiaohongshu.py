@@ -92,16 +92,6 @@ async def scrape_xiaohongshu(
             page = await context.new_page()
             page.set_default_timeout(20_000)
 
-            # Warm-up: let XHS set fingerprinting cookies (a1, webId, etc.) before scraping.
-            try:
-                await page.goto(_BASE, wait_until="domcontentloaded", timeout=20_000)
-                await page.wait_for_timeout(2_000)
-                await _assert_not_login_wall(page)
-            except SessionExpiredError:
-                raise
-            except Exception as exc:
-                logger.warning("XHS warm-up navigation failed: %s", exc)
-
             for i, keyword in enumerate(keywords):
                 if keyword_limits is not None:
                     limit = keyword_limits[i] if i < len(keyword_limits) else 0
@@ -113,8 +103,6 @@ async def scrape_xiaohongshu(
                     continue
                 found = await _scrape_keyword(page, keyword, limit, skip_urls=skip_urls)
                 candidates.extend(found)
-                if found:
-                    await page.wait_for_timeout(2_000)
 
             for i, handle in enumerate(valid_handles):
                 if creator_limits is not None:
@@ -129,7 +117,7 @@ async def scrape_xiaohongshu(
                 candidates.extend(found)
 
         finally:
-            await context.close()
+            await context.browser.close()
 
     candidates.sort(key=lambda c: c.engagement, reverse=True)
     return candidates[:max_results]
@@ -475,7 +463,10 @@ async def _fetch_note_tags(page: Page, listing_url: str, detail_url: str) -> lis
         return []
     try:
         await page.goto(detail_url, wait_until="domcontentloaded", timeout=20_000)
+        await _assert_not_login_wall(page)
         await page.wait_for_selector("#detail-desc", timeout=8_000)
+    except SessionExpiredError:
+        raise
     except Exception as exc:
         logger.debug("XHS: could not load note detail %s: %s", detail_url, exc)
         try:

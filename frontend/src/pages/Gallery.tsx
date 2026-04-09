@@ -31,6 +31,10 @@ export default function Gallery() {
   const [groupBy, setGroupBy] = useState<GroupBy>("date");
   const [selectedKeywords, setSelectedKeywords] = useState<Set<string>>(new Set());
   const [tagPlatform, setTagPlatform] = useState<"instagram" | "xiaohongshu">("instagram");
+  const [showAllVibeKeywords, setShowAllVibeKeywords] = useState(false);
+  const [showAllTags, setShowAllTags] = useState(false);
+
+  const TAG_LIMIT = 50;
 
   const allPosts = days.flatMap((d) => d.posts);
 
@@ -217,7 +221,7 @@ export default function Gallery() {
                     Clear
                   </button>
                 )}
-                {allVibeKeywords.map((kw) => {
+                {allVibeKeywords.slice(0, showAllVibeKeywords ? undefined : TAG_LIMIT).map((kw) => {
                   const active = selectedKeywords.has(kw);
                   return (
                     <button
@@ -232,6 +236,11 @@ export default function Gallery() {
                     </button>
                   );
                 })}
+                {allVibeKeywords.length > TAG_LIMIT && (
+                  <button style={s.clearBtn} onClick={() => setShowAllVibeKeywords(v => !v)}>
+                    {showAllVibeKeywords ? "Show less" : `+${allVibeKeywords.length - TAG_LIMIT} more`}
+                  </button>
+                )}
               </div>
             ) : (
               <p style={s.empty}>No vibe keywords yet — like some posts to build your taste profile.</p>
@@ -264,7 +273,7 @@ export default function Gallery() {
                     <button
                       key={p}
                       style={{ ...s.platformTab, ...(tagPlatform === p ? s.platformTabActive : {}) }}
-                      onClick={() => { setTagPlatform(p); setSelectedKeywords(new Set()); setModalIdx(null); }}
+                      onClick={() => { setTagPlatform(p); setSelectedKeywords(new Set()); setModalIdx(null); setShowAllTags(false); }}
                     >
                       {p === "instagram" ? "Instagram" : "小红书"}
                     </button>
@@ -283,7 +292,7 @@ export default function Gallery() {
                       Clear
                     </button>
                   )}
-                  {activeTags.map((tag) => {
+                  {activeTags.slice(0, showAllTags ? undefined : TAG_LIMIT).map((tag) => {
                     const active = selectedKeywords.has(tag);
                     return (
                       <button
@@ -298,6 +307,11 @@ export default function Gallery() {
                       </button>
                     );
                   })}
+                  {activeTags.length > TAG_LIMIT && (
+                    <button style={s.clearBtn} onClick={() => setShowAllTags(v => !v)}>
+                      {showAllTags ? "Show less" : `+${activeTags.length - TAG_LIMIT} more`}
+                    </button>
+                  )}
                 </div>
               ) : (
                 <p style={s.empty}>No tags yet for this platform.</p>

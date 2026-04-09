@@ -21,6 +21,7 @@ The other platform's scrape continues normally.
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import logging
 import math
@@ -88,12 +89,11 @@ async def run_scrape(force: bool = False) -> None:
     ig_run_id = _init_platform_run(run_id, Platform.instagram)
     xhs_run_id = _init_platform_run(run_id, Platform.xiaohongshu)
 
-    # Pre-load already-seen URLs so scrapers can avoid them
+    # Pre-load already-seen URLs. IG (instaloader/HTTP) and XHS (headful Playwright)
+    # use entirely separate stacks and disjoint URL namespaces — safe to run in parallel.
     seen_urls = _get_seen_urls()
 
-    # --- Instagram ---
-    ig_candidates: list[PostCandidate] = []
-    try:
+    async def _ig_task() -> list[PostCandidate]:
         if mode == RunMode.keyword:
             logger.info("Starting Instagram scrape (keyword=%r)", keyword)
             results = await _scrape_instagram(
@@ -102,51 +102,56 @@ async def run_scrape(force: bool = False) -> None:
                 max_results=_FETCH_LIMIT,
                 skip_urls=seen_urls,
             )
-            ig_candidates = _weighted_sample(results, _PER_PLATFORM)
-        else:
-            logger.info("Starting Instagram discovery scrape")
-            ig_candidates = await _discover_instagram(seen_urls)
-        logger.info("Instagram returned %d candidates.", len(ig_candidates))
-    except SessionExpiredError:
-        logger.warning("Instagram session expired — marking for re-auth.")
-        _invalidate_instagram_session()
-    except FileNotFoundError:
-        logger.warning("No Instagram session — skipping platform.")
-    except Exception as exc:
-        logger.error("Instagram scrape failed: %s", exc, exc_info=True)
+            return _weighted_sample(results, _PER_PLATFORM)
+        logger.info("Starting Instagram discovery scrape")
+        return await _discover_instagram(seen_urls)
 
-    persist_keyword = keyword if mode == RunMode.keyword else None
-
-    # Persist Instagram results immediately so the user can curate without waiting for XHS
-    ig_count = _persist_platform_results(run_id, Platform.instagram, ig_candidates, staging_dir, keyword=persist_keyword)
-    _finish_platform_run(ig_run_id, ig_count, skipped=not ig_candidates)
-
-    # Refresh seen_urls to include the Instagram posts we just saved
-    seen_urls = _get_seen_urls()
-
-    # --- Xiaohongshu ---
-    xhs_candidates: list[PostCandidate] = []
-    try:
+    async def _xhs_task() -> list[PostCandidate]:
         if mode == RunMode.keyword:
             logger.info("Starting Xiaohongshu scrape (keyword=%r)", keyword)
             results = await scrape_xiaohongshu(
                 keywords=[keyword] if keyword else [],
-                creator_handles=[],
                 max_results=_FETCH_LIMIT,
                 skip_urls=seen_urls,
             )
-            xhs_candidates = _weighted_sample(results, _PER_PLATFORM)
-        else:
-            logger.info("Starting Xiaohongshu discovery scrape")
-            xhs_candidates = await _discover_xhs(seen_urls)
-        logger.info("Xiaohongshu returned %d candidates.", len(xhs_candidates))
-    except SessionExpiredError:
+            return _weighted_sample(results, _PER_PLATFORM)
+        logger.info("Starting Xiaohongshu discovery scrape")
+        return await _discover_xhs(seen_urls)
+
+    ig_result, xhs_result = await asyncio.gather(
+        _ig_task(), _xhs_task(), return_exceptions=True
+    )
+
+    ig_candidates: list[PostCandidate] = []
+    if isinstance(ig_result, SessionExpiredError):
+        logger.warning("Instagram session expired — marking for re-auth.")
+        _invalidate_instagram_session()
+    elif isinstance(ig_result, FileNotFoundError):
+        logger.warning("No Instagram session — skipping platform.")
+    elif isinstance(ig_result, BaseException):
+        logger.error("Instagram scrape failed: %s", ig_result,
+                     exc_info=(type(ig_result), ig_result, ig_result.__traceback__))
+    else:
+        ig_candidates = ig_result
+        logger.info("Instagram returned %d candidates.", len(ig_candidates))
+
+    xhs_candidates: list[PostCandidate] = []
+    if isinstance(xhs_result, SessionExpiredError):
         logger.warning("Xiaohongshu session expired — marking for re-auth.")
         _invalidate_session("xiaohongshu")
-    except FileNotFoundError:
+    elif isinstance(xhs_result, FileNotFoundError):
         logger.warning("No Xiaohongshu session — skipping platform.")
-    except Exception as exc:
-        logger.error("Xiaohongshu scrape failed: %s", exc, exc_info=True)
+    elif isinstance(xhs_result, BaseException):
+        logger.error("Xiaohongshu scrape failed: %s", xhs_result,
+                     exc_info=(type(xhs_result), xhs_result, xhs_result.__traceback__))
+    else:
+        xhs_candidates = xhs_result
+        logger.info("Xiaohongshu returned %d candidates.", len(xhs_candidates))
+
+    persist_keyword = keyword if mode == RunMode.keyword else None
+
+    ig_count = _persist_platform_results(run_id, Platform.instagram, ig_candidates, staging_dir, keyword=persist_keyword)
+    _finish_platform_run(ig_run_id, ig_count, skipped=not ig_candidates)
 
     xhs_count = _persist_platform_results(run_id, Platform.xiaohongshu, xhs_candidates, staging_dir, keyword=persist_keyword)
     _finish_platform_run(xhs_run_id, xhs_count, skipped=not xhs_candidates)
@@ -233,12 +238,6 @@ def _init_daily_run(today: dt.date, force: bool = False) -> str | None:
         session.commit()
         session.refresh(daily_run)
         return daily_run.id
-
-
-def _get_top_creator(platform: Platform) -> str | None:
-    """Return the handle of the most-liked creator for the given platform, or None."""
-    creators = _get_top_creators(1, platform)
-    return creators[0] if creators else None
 
 
 def _get_top_creators(n: int, platform: Platform) -> list[str]:
@@ -348,64 +347,35 @@ async def _discover_instagram(seen_urls: set[str]) -> list[PostCandidate]:
 
 
 async def _discover_xhs(seen_urls: set[str]) -> list[PostCandidate]:
-    """Discovery-mode Xiaohongshu scrape.
-
-    Assembles a _FETCH_LIMIT-post pool with fixed percentage allocation:
-      60% tag #1 · 20% tag #2 · 10% tag #3 · 10% top creator
-    e.g. with _FETCH_LIMIT=50: 30 + 10 + 5 + 5 posts.
-
-    Each source is served from its per-keyword pickle cache when possible;
-    the browser only runs for cache misses.  Then _weighted_sample picks
-    _PER_PLATFORM posts from the combined pool.
-    """
-    all_creators = _get_top_creators(3, Platform.xiaohongshu)
+    """Discovery-mode Xiaohongshu scrape — tags only, 50/25/15/10% budget split."""
     all_tags = _get_top_tags(6, Platform.xiaohongshu)
 
-    if not all_creators and not all_tags:
-        logger.info("XHS discovery: no creators or tags yet — skipping.")
+    if not all_tags:
+        logger.info("XHS discovery: no tags yet — skipping.")
         return []
 
-    pool_tag1    = round(_PER_PLATFORM * 0.40)  # 2
-    pool_tag2    = round(_PER_PLATFORM * 0.20)  # 1
-    pool_tag3    = round(_PER_PLATFORM * 0.10)  # 0
-    pool_random  = round(_PER_PLATFORM * 0.20)  # 1
-    pool_creator = _PER_PLATFORM - pool_tag1 - pool_tag2 - pool_tag3 - pool_random  # 1
+    pool_tag1   = round(_PER_PLATFORM * 0.50)
+    pool_tag2   = round(_PER_PLATFORM * 0.25)
+    pool_tag3   = round(_PER_PLATFORM * 0.15)
+    pool_random = _PER_PLATFORM - pool_tag1 - pool_tag2 - pool_tag3
 
     tags       = all_tags[:3]
     random_tag = random.choice(all_tags[3:]) if len(all_tags) > 3 else None
-    creator    = next((c for c in all_creators if c), None)
-
-    # Try creator first — if no new posts, give the quota to tag #1
-    creator_posts: list[PostCandidate] = []
-    if creator and pool_creator > 0:
-        creator_posts = await scrape_xiaohongshu(
-            keywords=[],
-            creator_handles=[creator],
-            creator_limits=[pool_creator],
-            max_results=pool_creator,
-            skip_urls=seen_urls,
-        )
-        if not creator_posts:
-            logger.info("XHS discovery: no new posts from creator %r — giving quota to tag #1", creator)
-            pool_tag1 += pool_creator
 
     keywords       = tags + ([random_tag] if random_tag else [])
     keyword_limits = [pool_tag1, pool_tag2, pool_tag3] + ([pool_random] if random_tag else [])
 
     logger.info(
-        "XHS discovery: tags=%s random_tag=%s creator=%s budget=(tag1=%d tag2=%d tag3=%d random=%d creator=%d) creator_posts=%d",
-        tags, random_tag, creator, pool_tag1, pool_tag2, pool_tag3, pool_random, pool_creator, len(creator_posts),
+        "XHS discovery: tags=%s random_tag=%s budget=(tag1=%d tag2=%d tag3=%d random=%d)",
+        tags, random_tag, pool_tag1, pool_tag2, pool_tag3, pool_random,
     )
 
-    tag_posts = await scrape_xiaohongshu(
+    return await scrape_xiaohongshu(
         keywords=keywords,
-        creator_handles=[],
         keyword_limits=keyword_limits,
-        max_results=_PER_PLATFORM - len(creator_posts),
-        skip_urls=seen_urls | {c.source_url for c in creator_posts},
+        max_results=_PER_PLATFORM,
+        skip_urls=seen_urls,
     )
-
-    return creator_posts + tag_posts
 
 
 def _init_platform_run(run_id: str, platform: Platform) -> str:

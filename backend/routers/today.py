@@ -33,6 +33,25 @@ from backend.scraper.orchestrator import STAGING_DIR
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
+# Persistent keyword — survives across days until explicitly cleared.
+_KEYWORD_FILE = Path(__file__).parents[2] / "sessions" / "keyword.txt"
+
+
+def _load_persistent_keyword() -> str | None:
+    try:
+        kw = _KEYWORD_FILE.read_text().strip()
+        return kw or None
+    except FileNotFoundError:
+        return None
+
+
+def _save_persistent_keyword(kw: str | None) -> None:
+    if kw:
+        _KEYWORD_FILE.parent.mkdir(exist_ok=True)
+        _KEYWORD_FILE.write_text(kw)
+    else:
+        _KEYWORD_FILE.unlink(missing_ok=True)
+
 
 # ---------------------------------------------------------------------------
 # Pydantic I/O models
@@ -138,10 +157,13 @@ async def get_today() -> TodayResponse:
                 else:
                     xhs_progress = prog
 
+        # Keyword: prefer what's on the run, fall back to persistent file
+        keyword = (run.keyword if run else None) or _load_persistent_keyword()
+
         return TodayResponse(
             date=today.isoformat(),
             status=run.status.value if run else RunStatus.pending.value,
-            keyword=run.keyword if run else None,
+            keyword=keyword,
             pending_count=pending_count,
             posts=[
                 PostOut(
@@ -161,12 +183,13 @@ async def get_today() -> TodayResponse:
 
 @router.post("/api/today/keyword", response_model=KeywordResponse)
 async def set_today_keyword(body: KeywordBody) -> KeywordResponse:
+    kw = body.keyword.strip() or None
+    _save_persistent_keyword(kw)
     today = dt.date.today()
     with Session(engine) as session:
         run = session.exec(
             select(DailyRun).where(DailyRun.run_date == today)
         ).first()
-        kw = body.keyword.strip() or None
         if run is None:
             run = DailyRun(
                 run_date=today,
@@ -180,7 +203,23 @@ async def set_today_keyword(body: KeywordBody) -> KeywordResponse:
             run.mode = RunMode.keyword if kw else RunMode.vibe
             session.add(run)
         session.commit()
-    return KeywordResponse(keyword=body.keyword)
+    return KeywordResponse(keyword=kw or "")
+
+
+@router.delete("/api/today/keyword", response_model=KeywordResponse)
+async def clear_keyword() -> KeywordResponse:
+    _save_persistent_keyword(None)
+    today = dt.date.today()
+    with Session(engine) as session:
+        run = session.exec(
+            select(DailyRun).where(DailyRun.run_date == today)
+        ).first()
+        if run is not None:
+            run.keyword = None
+            run.mode = RunMode.vibe
+            session.add(run)
+            session.commit()
+    return KeywordResponse(keyword="")
 
 
 @router.post("/api/posts/{post_id}/like", response_model=ActionResponse)

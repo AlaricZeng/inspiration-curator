@@ -96,25 +96,23 @@ async def run_scrape(force: bool = False) -> None:
     async def _ig_task() -> list[PostCandidate]:
         if mode == RunMode.keyword:
             logger.info("Starting Instagram scrape (keyword=%r)", keyword)
-            results = await _scrape_instagram(
+            return await _scrape_instagram(
                 keyword=keyword,
                 creator_handles=[],
-                max_results=_FETCH_LIMIT,
+                max_results=_PER_PLATFORM,
                 skip_urls=seen_urls,
             )
-            return _weighted_sample(results, _PER_PLATFORM)
         logger.info("Starting Instagram discovery scrape")
         return await _discover_instagram(seen_urls)
 
     async def _xhs_task() -> list[PostCandidate]:
         if mode == RunMode.keyword:
             logger.info("Starting Xiaohongshu scrape (keyword=%r)", keyword)
-            results = await scrape_xiaohongshu(
+            return await scrape_xiaohongshu(
                 keywords=[keyword] if keyword else [],
-                max_results=_FETCH_LIMIT,
+                max_results=_PER_PLATFORM,
                 skip_urls=seen_urls,
             )
-            return _weighted_sample(results, _PER_PLATFORM)
         logger.info("Starting Xiaohongshu discovery scrape")
         return await _discover_xhs(seen_urls)
 
@@ -229,10 +227,13 @@ def _init_daily_run(today: dt.date, force: bool = False) -> str | None:
             session.commit()
             return existing.id
 
+        from backend.routers.today import _load_persistent_keyword
+        kw = _load_persistent_keyword()
         daily_run = DailyRun(
             run_date=today,
             status=RunStatus.running,
-            mode=RunMode.vibe,
+            mode=RunMode.keyword if kw else RunMode.vibe,
+            keyword=kw,
         )
         session.add(daily_run)
         session.commit()

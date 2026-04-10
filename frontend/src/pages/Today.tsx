@@ -27,13 +27,14 @@ interface TodayData {
 
 export default function Today() {
   const [data, setData] = useState<TodayData | null>(null);
-  const [keyword, setKeyword] = useState("");
+  const [keywordInput, setKeywordInput] = useState("");
   const [saving, setSaving] = useState(false);
+  const [clearing, setClearing] = useState(false);
+  const keywordInitRef = useRef(false);
   const [launching, setLaunching] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [seedNeeded, setSeedNeeded] = useState(false);
   const [seedingPreset, setSeedingPreset] = useState<string | null>(null);
-  const initializedRef = useRef(false);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const checkSeedNeeded = useCallback(async () => {
@@ -54,9 +55,9 @@ export default function Today() {
       if (!res.ok) throw new Error("Failed to fetch today's status");
       const d = (await res.json()) as TodayData;
       setData(d);
-      if (!initializedRef.current) {
-        setKeyword(d.keyword ?? "");
-        initializedRef.current = true;
+      if (!keywordInitRef.current) {
+        setKeywordInput(d.keyword ?? "");
+        keywordInitRef.current = true;
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : "Unknown error");
@@ -92,22 +93,39 @@ export default function Today() {
     };
   }, [data?.status, load]);
 
-  const handleKeyword = async (e: React.FormEvent) => {
+  const handleSaveKeyword = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!keywordInput.trim()) return;
     setSaving(true);
     setError(null);
     try {
       const res = await fetch("/api/today/keyword", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ keyword: keyword.trim() }),
+        body: JSON.stringify({ keyword: keywordInput.trim() }),
       });
       if (!res.ok) throw new Error("Failed to save keyword");
+      setKeywordInput("");
       await load();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Unknown error");
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleClearKeyword = async () => {
+    setClearing(true);
+    setError(null);
+    try {
+      const res = await fetch("/api/today/keyword", { method: "DELETE" });
+      if (!res.ok) throw new Error("Failed to clear keyword");
+      setKeywordInput("");
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Unknown error");
+    } finally {
+      setClearing(false);
     }
   };
 
@@ -192,19 +210,37 @@ export default function Today() {
             </div>
           )}
 
-          <form onSubmit={(e) => void handleKeyword(e)} style={s.form}>
-            <label style={s.label}>Today's keyword</label>
+          <form onSubmit={(e) => void handleSaveKeyword(e)} style={s.form}>
+            <label style={s.label}>
+              Search keyword{data?.keyword ? <span style={s.keywordSaved}> — {data.keyword}</span> : null}
+            </label>
             <div style={s.row}>
               <input
                 style={s.input}
                 type="text"
-                placeholder="e.g. moody architecture"
-                value={keyword}
-                onChange={(e) => setKeyword(e.target.value)}
-                onBlur={(e) => void handleKeyword(e as unknown as React.FormEvent)}
+                placeholder="e.g. Japan cherry blossom"
+                value={keywordInput}
+                onChange={(e) => setKeywordInput(e.target.value)}
               />
+              <button
+                style={{ ...s.btn, ...s.btnSecondary, ...(saving || !keywordInput.trim() ? s.btnDisabled : {}) }}
+                type="submit"
+                disabled={saving || !keywordInput.trim()}
+              >
+                {saving ? "…" : "Save"}
+              </button>
+              <button
+                type="button"
+                style={{ ...s.btn, ...s.btnDanger, ...(!data?.keyword || clearing ? s.btnDisabled : {}) }}
+                onClick={() => void handleClearKeyword()}
+                disabled={!data?.keyword || clearing}
+              >
+                {clearing ? "…" : "Clear"}
+              </button>
             </div>
-            <p style={s.hint}>Leave blank to use your taste profile. Resets at midnight.</p>
+            <p style={s.hint}>
+              {data?.keyword ? "Saved — all scrapes will use this keyword until cleared." : "Leave blank to use your taste profile."}
+            </p>
           </form>
 
           <div style={s.actions}>
@@ -435,6 +471,8 @@ const s: Record<string, CSSProperties> = {
     cursor: "pointer",
   },
   btnSecondary: { background: "#252525", color: "#ccc", border: "1px solid #333" },
+  btnDanger: { background: "#2a1010", color: "#ef5350", border: "1px solid #5c1a1a", flexShrink: 0 },
+  keywordSaved: { color: "#7986cb", fontWeight: 400 },
   btnAccent: {
     background: "#0d2b1a",
     color: "#4caf50",

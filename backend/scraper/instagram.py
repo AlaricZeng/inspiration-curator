@@ -1,44 +1,153 @@
-"""Instagram scraper using instaloader + Instagram's web API.
+"""Instagram scraper — headful Chrome, UI-driven.
 
-Keyword mode:  fetches top posts for a hashtag via /api/v1/tags/web_info/
-               Paginates using next_max_id so runs 1-50, 51-100, … until
-               enough fresh posts are collected or the feed is exhausted.
-Creator mode:  fetches recent posts from each creator's profile
+Keyword mode:
+  Navigates directly to https://www.instagram.com/explore/search/keyword/?q={keyword},
+  waits for the post grid, downloads visible post thumbnails, scrolls for more.
 
-Images are fetched at full resolution using image_versions2.candidates[0]
-(largest available, typically 1080px+).
+Creator mode:
+  Navigates to https://www.instagram.com/{username}/ and harvests the post grid.
 
-Returns up to *max_results* PostCandidates ranked by engagement (highest first).
-Raises SessionExpiredError if instaloader reports the session is invalid.
-Raises FileNotFoundError if no session file exists yet.
+Session bootstrap
+-----------------
+Loads sessions/instagram.json (Playwright storage state).  If only an instaloader
+*.session file exists, cookies are auto-converted on first use and saved as
+instagram.json so subsequent runs skip the conversion.
+
+Anti-detection
+--------------
+- Headless Chrome (headless=True)
+- --disable-blink-features=AutomationControlled launch arg
+- Stealth JS patches (navigator.webdriver, window.chrome, plugins, languages)
+- 10–18 s human-like waits between major UI actions
+
+Returns up to *max_results* PostCandidates.
+Raises SessionExpiredError if a login wall is detected.
+Raises FileNotFoundError if no session file exists.
 """
 
 from __future__ import annotations
 
-import asyncio
+import json
 import logging
-from typing import Optional
+import random
+import re
+from dataclasses import dataclass
+from urllib.parse import quote, urlparse
 
-import instaloader
+import httpx
+from playwright.async_api import Page, async_playwright
 
+from backend.scraper.browser import SESSIONS_DIR
 from backend.scraper.errors import PostCandidate, SessionExpiredError
-from backend.scraper.instagram_loader import get_any_loader
 
 logger = logging.getLogger(__name__)
 
-_IG_HEADERS = {
-    "x-ig-app-id": "936619743392459",
-    "x-requested-with": "XMLHttpRequest",
-    "referer": "https://www.instagram.com/",
-    "user-agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/122.0.0.0 Safari/537.36"
-    ),
+_IG_BASE = "https://www.instagram.com"
+_IG_SESSION_FILE = SESSIONS_DIR / "instagram.json"
+
+_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
+)
+
+_LOGIN_PATH_FRAGMENTS = ("/accounts/login/", "/challenge/")
+_NO_NEW_CARDS_LIMIT = 3
+
+_STEALTH_JS = """
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined, configurable: true });
+
+if (!window.chrome) {
+    window.chrome = {
+        app: { isInstalled: false },
+        webstore: { onInstallStageChanged: {}, onDownloadProgress: {} },
+        runtime: {
+            PlatformOs: { MAC: 'mac', WIN: 'win', ANDROID: 'android', CROS: 'cros', LINUX: 'linux', OPENBSD: 'openbsd' },
+            PlatformArch: { ARM: 'arm', X86_32: 'x86-32', X86_64: 'x86-64' },
+            PlatformNaclArch: { ARM: 'arm', X86_32: 'x86-32', X86_64: 'x86-64' },
+        },
+    };
 }
 
-# Max pages to paginate through for hashtag "top" results (50 posts per page)
-_HASHTAG_MAX_PAGES = 5
+const _origPermQuery = window.navigator.permissions.query.bind(navigator.permissions);
+window.navigator.permissions.__proto__.query = (p) =>
+    p.name === 'notifications'
+        ? Promise.resolve({ state: Notification.permission })
+        : _origPermQuery(p);
+
+Object.defineProperty(navigator, 'plugins', {
+    get: () => {
+        const arr = [
+            { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+            { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
+            { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' },
+        ];
+        arr.__proto__ = PluginArray.prototype;
+        return arr;
+    },
+});
+
+Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+
+delete window.__playwright;
+delete window.__pw_manual;
+delete window.__PW_inspect;
+"""
+
+
+# ---------------------------------------------------------------------------
+# Human-like timing
+# ---------------------------------------------------------------------------
+
+
+async def _human_wait(page: Page) -> None:
+    """Wait 10–18 s to mimic human browsing pace."""
+    ms = int(random.uniform(10_000, 18_000))
+    logger.debug("IG: waiting %.0fs", ms / 1000)
+    await page.wait_for_timeout(ms)
+
+
+# ---------------------------------------------------------------------------
+# Session bootstrap
+# ---------------------------------------------------------------------------
+
+
+def _bootstrap_session_file() -> None:
+    """Ensure instagram.json (Playwright storage state) exists.
+
+    If it already exists, returns immediately. Otherwise, attempts to convert
+    cookies from a saved instaloader *.session file. This lets username/password
+    logins (instaloader) work transparently with the new browser-based scraper.
+
+    Raises FileNotFoundError if no session of any kind is available.
+    """
+    if _IG_SESSION_FILE.exists():
+        return
+
+    try:
+        from backend.scraper.instagram_loader import get_any_loader
+        L = get_any_loader()
+        cookies = []
+        for c in L.context._session.cookies:
+            cookies.append({
+                "name": c.name,
+                "value": c.value,
+                "domain": c.domain if c.domain else ".instagram.com",
+                "path": c.path or "/",
+                "expires": int(c.expires) if c.expires else -1,
+                "httpOnly": False,
+                "secure": True,
+                "sameSite": "None",
+            })
+        _IG_SESSION_FILE.write_text(json.dumps({"cookies": cookies, "origins": []}))
+        logger.info("IG: created instagram.json from instaloader session (%d cookies).", len(cookies))
+    except FileNotFoundError:
+        raise
+    except Exception as exc:
+        logger.warning("IG: could not create instagram.json from instaloader session: %s", exc)
+        raise FileNotFoundError(
+            "No Instagram session. Authenticate via POST /api/auth/instagram or import cookies."
+        ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -52,236 +161,269 @@ async def scrape_instagram(
     max_results: int = 10,
     skip_urls: set[str] | None = None,
 ) -> list[PostCandidate]:
-    """Scrape Instagram and return up to *max_results* fresh candidates ranked by engagement.
-
-    Args:
-        skip_urls: Source URLs already seen in the DB — skipped during collection
-                   so the caller always receives only new posts.
+    """Scrape Instagram using a headful browser and return up to *max_results* fresh candidates.
 
     Raises:
-        SessionExpiredError: session is invalid / expired.
+        SessionExpiredError: login wall detected during scraping.
         FileNotFoundError:   no session file — user must authenticate first.
     """
-    try:
-        L = get_any_loader()
-    except instaloader.exceptions.BadCredentialsException:
-        raise SessionExpiredError("instagram")
+    _bootstrap_session_file()
 
-    loop = asyncio.get_event_loop()
+    candidates: list[PostCandidate] = []
 
-    def _discover() -> list[PostCandidate]:
-        candidates: list[PostCandidate] = []
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        context = await browser.new_context(
+            storage_state=str(_IG_SESSION_FILE),
+            user_agent=_USER_AGENT,
+            viewport={"width": 1920, "height": 1080},
+        )
+        await context.add_init_script(script=_STEALTH_JS)
 
-        if keyword:
-            tag = keyword.replace(" ", "").strip()
-            if tag:
-                try:
-                    found = _scrape_hashtag(L, tag, max_results, skip_urls=skip_urls)
-                    candidates.extend(found)
-                except instaloader.exceptions.LoginRequiredException:
-                    raise SessionExpiredError("instagram")
-                except Exception as exc:
-                    logger.warning("Instagram hashtag scrape failed for #%s: %s", tag, exc)
+        page = await context.new_page()
+        page.set_default_timeout(30_000)
 
-        for handle in creator_handles:
-            if len(candidates) >= max_results:
-                break
-            try:
-                found = _scrape_profile(
-                    L, handle, max_results - len(candidates), skip_urls=skip_urls
+        try:
+            if keyword:
+                found = await _scrape_keyword(page, keyword, max_results, skip_urls)
+                candidates.extend(found)
+
+            for handle in creator_handles:
+                if len(candidates) >= max_results:
+                    break
+                found = await _scrape_creator(
+                    page, handle, max_results - len(candidates), skip_urls
                 )
                 candidates.extend(found)
-            except instaloader.exceptions.LoginRequiredException:
-                raise SessionExpiredError("instagram")
-            except Exception as exc:
-                logger.warning("Instagram profile scrape failed for %s: %s", handle, exc)
 
-        candidates.sort(key=lambda c: c.engagement, reverse=True)
-        return candidates[:max_results]
+        except SessionExpiredError:
+            raise
+        except Exception as exc:
+            try:
+                shot_path = SESSIONS_DIR / "ig_debug.png"
+                await page.screenshot(path=str(shot_path), full_page=False)
+                logger.error(
+                    "IG: session aborted — %s | URL=%s title=%r | screenshot → %s",
+                    exc, page.url, await page.title(), shot_path,
+                )
+            except Exception:
+                logger.error("IG: session aborted — %s", exc)
+            raise
+        finally:
+            await browser.close()
 
-    return await loop.run_in_executor(None, _discover)
+    candidates.sort(key=lambda c: c.engagement, reverse=True)
+    return candidates[:max_results]
 
 
 # ---------------------------------------------------------------------------
-# Discovery helpers (instaloader, synchronous)
+# Keyword + creator entry points
 # ---------------------------------------------------------------------------
 
 
-def _scrape_hashtag(
-    L: instaloader.Instaloader,
-    hashtag: str,
+async def _scrape_keyword(
+    page: Page,
+    keyword: str,
     limit: int,
-    *,
-    skip_urls: set[str] | None = None,
+    skip_urls: set[str] | None,
 ) -> list[PostCandidate]:
-    """Fetch top posts for a hashtag, paginating through batches of ~50.
-
-    Stays exclusively within the "top" ranked feed. If page 1 (posts 1–50)
-    doesn't yield enough fresh posts, fetches page 2 (51–100), page 3, etc.,
-    up to _HASHTAG_MAX_PAGES. Never falls back to "recent".
-    """
-    tag = hashtag.lstrip("#")
-    session = L.context._session
-
-    seen_shortcodes: set[str] = set()
-    candidates: list[PostCandidate] = []
-    next_max_id: str | None = None  # pagination cursor; None = first page
-
-    for page_num in range(1, _HASHTAG_MAX_PAGES + 1):
-        url = f"https://www.instagram.com/api/v1/tags/web_info/?tag_name={tag}"
-        if next_max_id:
-            url += f"&next_max_id={next_max_id}"
-
-        try:
-            r = session.get(url, headers=_IG_HEADERS, timeout=15)
-            r.raise_for_status()
-            data = r.json()
-        except Exception as exc:
-            logger.warning("IG hashtag API error (page %d): %s", page_num, exc)
-            break
-
-        top = data.get("data", {}).get("top", {})
-        sections = top.get("sections", [])
-
-        page_new = 0
-        for section in sections:
-            for layout in section.get("layout_content", {}).get("medias", []):
-                media = layout.get("media", {})
-                shortcode = media.get("code") or media.get("shortcode")
-                if not shortcode or shortcode in seen_shortcodes:
-                    continue
-                seen_shortcodes.add(shortcode)
-
-                source_url = f"https://www.instagram.com/p/{shortcode}/"
-                if skip_urls and source_url in skip_urls:
-                    logger.debug("IG: skipping already-seen %s", source_url)
-                    continue
-
-                creator = media.get("user", {}).get("username", "")
-                engagement = media.get("like_count", 0)
-                img_versions = media.get("image_versions2", {}).get("candidates", [])
-                thumb_url = img_versions[0].get("url") if img_versions else None
-                screenshot_data = _fetch_url(session, thumb_url) if thumb_url else b""
-                if not screenshot_data:
-                    continue
-
-                caption_obj = media.get("caption")
-                caption_text = caption_obj.get("text", "") if isinstance(caption_obj, dict) else ""
-                tags = [w.lstrip("#") for w in caption_text.split() if w.startswith("#")]
-
-                candidates.append(PostCandidate(
-                    source_url=source_url,
-                    creator=creator,
-                    engagement=engagement,
-                    screenshot_data=screenshot_data,
-                    from_creator=False,
-                    tags=tags,
-                ))
-                page_new += 1
-
-                if len(candidates) >= limit:
-                    logger.debug("IG hashtag #%s: filled %d slots on page %d.", tag, limit, page_num)
-                    return candidates
-
-        logger.debug(
-            "IG hashtag #%s page %d: %d new fresh posts; total %d/%d.",
-            tag, page_num, page_new, len(candidates), limit,
-        )
-
-        # Advance cursor.  Log all top-level keys the first time so we can
-        # confirm the real cursor field name from the API response.
-        if page_num == 1:
-            logger.info("IG hashtag top-object keys: %s", list(top.keys()))
-
-        next_max_id = (
-            top.get("next_max_id")
-            or top.get("more_available_cursor")
-            or top.get("next_cursor")
-            or top.get("end_cursor")
-        )
-        if not next_max_id:
-            logger.debug("IG hashtag #%s: no pagination cursor after page %d (keys: %s).",
-                         tag, page_num, list(top.keys()))
-            break
-        logger.debug("IG hashtag #%s: advancing to page %d with cursor %r.", tag, page_num + 1, next_max_id[:20])
-
-    return candidates
+    url = f"{_IG_BASE}/explore/search/keyword/?q={quote(keyword)}"
+    logger.info("IG: keyword search %r → %s", keyword, url)
+    await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+    await _dismiss_dialogs(page)
+    await _human_wait(page)
+    await _assert_not_login_wall(page)
+    return await _harvest_grid(page, keyword, limit, skip_urls, from_creator=False)
 
 
-def _fetch_url(session: object, url: str, *, retries: int = 3, backoff: float = 2.0) -> bytes:
-    """Fetch a URL with simple retry/backoff on failure."""
-    import time
-    last_exc: Exception | None = None
-    for attempt in range(1, retries + 1):
-        try:
-            r = session.get(url, timeout=15)  # type: ignore[union-attr]
-            r.raise_for_status()
-            return r.content
-        except Exception as exc:
-            last_exc = exc
-            if attempt < retries:
-                sleep_for = backoff * attempt
-                logger.debug("Fetch attempt %d/%d failed for %s: %s — retrying in %.1fs",
-                             attempt, retries, url, exc, sleep_for)
-                time.sleep(sleep_for)
-    logger.debug("Failed to fetch image after %d attempts %s: %s", retries, url, last_exc)
-    return b""
-
-
-def _scrape_profile(
-    L: instaloader.Instaloader,
+async def _scrape_creator(
+    page: Page,
     handle: str,
     limit: int,
-    *,
-    skip_urls: set[str] | None = None,
+    skip_urls: set[str] | None,
 ) -> list[PostCandidate]:
-    """Fetch recent posts from a creator profile, skipping already-seen URLs."""
-    profile = instaloader.Profile.from_username(L.context, handle.lstrip("@"))
-    candidates: list[PostCandidate] = []
+    handle = handle.lstrip("@")
+    url = f"{_IG_BASE}/{handle}/"
+    logger.info("IG: creator profile %r → %s", handle, url)
+    await page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+    await _dismiss_dialogs(page)
+    await _human_wait(page)
+    await _assert_not_login_wall(page)
+    return await _harvest_grid(page, handle, limit, skip_urls, from_creator=True)
 
-    for post in profile.get_posts():
-        if len(candidates) >= limit:
-            break
-        source_url = f"https://www.instagram.com/p/{post.shortcode}/"
-        if skip_urls and source_url in skip_urls:
-            logger.debug("IG: skipping already-seen profile post %s", source_url)
+
+# ---------------------------------------------------------------------------
+# Grid harvesting
+# ---------------------------------------------------------------------------
+
+
+async def _harvest_grid(
+    page: Page,
+    label: str,
+    limit: int,
+    skip_urls: set[str] | None,
+    *,
+    from_creator: bool,
+) -> list[PostCandidate]:
+    """Collect up to *limit* post candidates from the current page's post grid."""
+    processed_urls: set[str] = set(skip_urls or [])
+    candidates: list[PostCandidate] = []
+    no_new_rounds = 0
+
+    try:
+        await page.wait_for_selector('a[href^="/p/"]', timeout=15_000)
+    except Exception:
+        logger.warning("IG %r: no post links visible on %s", label, page.url)
+        return candidates
+
+    cookies = await page.context.cookies()
+    cookie_header = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
+
+    while len(candidates) < limit and no_new_rounds < _NO_NEW_CARDS_LIMIT:
+        all_cards = await _collect_post_cards(page)
+        new_cards = [c for c in all_cards if c.url not in processed_urls]
+
+        if not new_cards:
+            no_new_rounds += 1
+            logger.debug("IG %r: no new cards (streak %d), scrolling", label, no_new_rounds)
+            await page.evaluate("window.scrollBy(0, 1200)")
+            await _human_wait(page)
             continue
-        c = _post_to_candidate(L, post, from_creator=True)
-        if c:
-            candidates.append(c)
+
+        no_new_rounds = 0
+        for card in new_cards:
+            if len(candidates) >= limit:
+                break
+            processed_urls.add(card.url)
+
+            cover_data = await _download_cover(card.cover_img_url, cookie_header)
+            if not cover_data:
+                logger.debug("IG: no cover for %s, skipping", card.url)
+                continue
+
+            candidates.append(PostCandidate(
+                source_url=card.url,
+                creator=card.creator,
+                engagement=0,
+                screenshot_data=cover_data,
+                from_creator=from_creator,
+                tags=[],
+            ))
+            logger.info("IG %r: harvested %d/%d", label, len(candidates), limit)
+
+        if len(candidates) < limit:
+            await page.evaluate("window.scrollBy(0, 1200)")
+            await _human_wait(page)
 
     return candidates
 
 
-def _post_to_candidate(
-    L: instaloader.Instaloader,
-    post: instaloader.Post,
-    *,
-    from_creator: bool,
-) -> Optional[PostCandidate]:
+# ---------------------------------------------------------------------------
+# DOM helpers
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _PostCard:
+    url: str
+    cover_img_url: str
+    creator: str = ""
+
+
+async def _collect_post_cards(page: Page) -> list[_PostCard]:
+    """Collect all currently-visible post cards from the grid."""
+    cards: list[_PostCard] = []
+    seen_urls: set[str] = set()
+
+    links = await page.query_selector_all('a[href^="/p/"]')
+    for link in links:
+        try:
+            href = await link.get_attribute("href") or ""
+            url = (f"{_IG_BASE}{href}" if href.startswith("/") else href).split("?")[0].rstrip("/")
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+
+            img = await link.query_selector("img")
+            if not img:
+                continue
+            src = (await img.get_attribute("src") or "").strip()
+            if not src or src.startswith("data:"):
+                continue
+
+            # Instagram alt text is often "Photo by @username on [date] …"
+            alt = await img.get_attribute("alt") or ""
+            m = re.search(r"@([\w.]+)", alt)
+            creator = m.group(1) if m else ""
+
+            cards.append(_PostCard(url=url, cover_img_url=src, creator=creator))
+        except Exception:
+            continue
+
+    logger.debug("IG DOM: %d post links → %d cards", len(links), len(cards))
+    return cards
+
+
+# ---------------------------------------------------------------------------
+# Dialog dismissal + login wall detection
+# ---------------------------------------------------------------------------
+
+
+async def _dismiss_dialogs(page: Page) -> None:
+    """Dismiss common Instagram interstitial prompts (notifications, etc.)."""
+    for selector in [
+        'button:has-text("Not Now")',
+        'button:has-text("Dismiss")',
+        '[aria-label="Close"]:visible',
+    ]:
+        try:
+            el = page.locator(selector).first
+            if await el.is_visible(timeout=2_000):
+                await el.click()
+                await page.wait_for_timeout(500)
+        except Exception:
+            pass
+
+
+def _is_login_url(url: str) -> bool:
+    path = urlparse(url).path
+    return any(path.startswith(frag) for frag in _LOGIN_PATH_FRAGMENTS)
+
+
+async def _assert_not_login_wall(page: Page) -> None:
+    if _is_login_url(page.url):
+        raise SessionExpiredError("instagram")
+    for sel in ['form:has(input[name="username"])', '[data-testid="login-modal"]']:
+        try:
+            el = await page.query_selector(sel)
+            if el and await el.is_visible():
+                raise SessionExpiredError("instagram")
+        except SessionExpiredError:
+            raise
+        except Exception:
+            continue
+
+
+# ---------------------------------------------------------------------------
+# Image download
+# ---------------------------------------------------------------------------
+
+
+async def _download_cover(url: str, cookie_header: str) -> bytes:
+    """Download a post cover image. Returns empty bytes on failure."""
     try:
-        source_url = f"https://www.instagram.com/p/{post.shortcode}/"
-        creator = post.owner_username
-        engagement = post.likes
-        try:
-            tags = list(post.caption_hashtags) if post.caption_hashtags else []
-        except Exception:
-            tags = []
-        # post.url is already the full-resolution image URL
-        try:
-            resp = L.context._session.get(post.url, timeout=15)
-            resp.raise_for_status()
-            screenshot_data = resp.content
-        except Exception:
-            screenshot_data = b""
-        return PostCandidate(
-            source_url=source_url,
-            creator=creator,
-            engagement=engagement,
-            screenshot_data=screenshot_data,
-            from_creator=from_creator,
-            tags=tags,
-        )
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            resp = await client.get(url, headers={
+                "Referer": "https://www.instagram.com/",
+                "Cookie": cookie_header,
+                "User-Agent": _USER_AGENT,
+            })
+            if resp.status_code == 200 and resp.content:
+                return resp.content
+            logger.debug("IG cover fetch %s: HTTP %s", url, resp.status_code)
     except Exception as exc:
-        logger.debug("Skipping post due to error: %s", exc)
-        return None
+        logger.debug("IG cover download error: %s", exc)
+    return b""

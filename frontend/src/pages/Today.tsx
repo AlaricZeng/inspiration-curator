@@ -162,10 +162,6 @@ export default function Today() {
   };
 
   const isRunning = data?.status === "running" || launching;
-  const canCurate = data?.status === "done" && (data?.pending_count ?? 0) > 0;
-  const igDone = data?.instagram?.status === "done" && (data.instagram.post_count ?? 0) > 0;
-  const xhsDone = data?.xiaohongshu?.status === "done" && (data.xiaohongshu.post_count ?? 0) > 0;
-  const showEarlyCurate = isRunning && (igDone || xhsDone);
 
   return (
     <div style={s.page}>
@@ -186,7 +182,9 @@ export default function Today() {
             </div>
           )}
 
-          {isRunning && <RunProgress instagram={data?.instagram ?? null} xiaohongshu={data?.xiaohongshu ?? null} />}
+          {data && (data.instagram || data.xiaohongshu) && (
+            <RunProgress instagram={data.instagram ?? null} xiaohongshu={data.xiaohongshu ?? null} />
+          )}
 
           {seedNeeded && (
             <div style={s.seedBox}>
@@ -252,15 +250,9 @@ export default function Today() {
               {isRunning ? "Running…" : "Run Now"}
             </button>
 
-            {showEarlyCurate && (
+            {(data?.pending_count ?? 0) > 0 && (
               <Link to="/curate" style={{ ...s.btn, ...s.btnAccent, textDecoration: "none" }}>
-                Curate now — {data!.pending_count} posts ready
-              </Link>
-            )}
-
-            {canCurate && (
-              <Link to="/curate" style={{ ...s.btn, ...s.btnAccent, textDecoration: "none" }}>
-                Start Curation — {data!.pending_count} posts
+                Review — {data!.pending_count}
               </Link>
             )}
           </div>
@@ -273,12 +265,11 @@ export default function Today() {
 function PlatformBar({ label, progress }: { label: string; progress: PlatformProgress | null }) {
   const isDone = progress?.status === "done";
   const isSkipped = progress?.status === "skipped";
-  const isRunning = progress?.status === "running" || progress == null;
 
   let statusText = "waiting…";
-  if (isDone) statusText = `${progress!.post_count} posts ready`;
+  if (isDone) statusText = `${progress!.post_count} posts`;
   else if (isSkipped) statusText = "skipped";
-  else if (isRunning) statusText = "fetching…";
+  else if (progress?.status === "running" || progress == null) statusText = "fetching…";
 
   return (
     <div style={rp.platformRow}>
@@ -299,7 +290,10 @@ function PlatformBar({ label, progress }: { label: string; progress: PlatformPro
   );
 }
 
-function RunProgress({ instagram, xiaohongshu }: { instagram: PlatformProgress | null; xiaohongshu: PlatformProgress | null }) {
+function RunProgress({ instagram, xiaohongshu }: {
+  instagram: PlatformProgress | null;
+  xiaohongshu: PlatformProgress | null;
+}) {
   return (
     <div style={rp.wrap}>
       <style>{`

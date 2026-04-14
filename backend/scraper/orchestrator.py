@@ -89,70 +89,79 @@ async def run_scrape(force: bool = False) -> None:
     ig_run_id = _init_platform_run(run_id, Platform.instagram)
     xhs_run_id = _init_platform_run(run_id, Platform.xiaohongshu)
 
-    # Pre-load already-seen URLs. IG (instaloader/HTTP) and XHS (headful Playwright)
-    # use entirely separate stacks and disjoint URL namespaces — safe to run in parallel.
+    # Pre-load already-seen URLs. IG and XHS use disjoint URL namespaces — safe to run in parallel.
     seen_urls = _get_seen_urls()
-
-    async def _ig_task() -> list[PostCandidate]:
-        if mode == RunMode.keyword:
-            logger.info("Starting Instagram scrape (keyword=%r)", keyword)
-            return await _scrape_instagram(
-                keyword=keyword,
-                creator_handles=[],
-                max_results=_PER_PLATFORM,
-                skip_urls=seen_urls,
-            )
-        logger.info("Starting Instagram discovery scrape")
-        return await _discover_instagram(seen_urls)
-
-    async def _xhs_task() -> list[PostCandidate]:
-        if mode == RunMode.keyword:
-            logger.info("Starting Xiaohongshu scrape (keyword=%r)", keyword)
-            return await scrape_xiaohongshu(
-                keywords=[keyword] if keyword else [],
-                max_results=_PER_PLATFORM,
-                skip_urls=seen_urls,
-            )
-        logger.info("Starting Xiaohongshu discovery scrape")
-        return await _discover_xhs(seen_urls)
-
-    ig_result, xhs_result = await asyncio.gather(
-        _ig_task(), _xhs_task(), return_exceptions=True
-    )
-
-    ig_candidates: list[PostCandidate] = []
-    if isinstance(ig_result, SessionExpiredError):
-        logger.warning("Instagram session expired — marking for re-auth.")
-        _invalidate_instagram_session()
-    elif isinstance(ig_result, FileNotFoundError):
-        logger.warning("No Instagram session — skipping platform.")
-    elif isinstance(ig_result, BaseException):
-        logger.error("Instagram scrape failed: %s", ig_result,
-                     exc_info=(type(ig_result), ig_result, ig_result.__traceback__))
-    else:
-        ig_candidates = ig_result
-        logger.info("Instagram returned %d candidates.", len(ig_candidates))
-
-    xhs_candidates: list[PostCandidate] = []
-    if isinstance(xhs_result, SessionExpiredError):
-        logger.warning("Xiaohongshu session expired — marking for re-auth.")
-        _invalidate_session("xiaohongshu")
-    elif isinstance(xhs_result, FileNotFoundError):
-        logger.warning("No Xiaohongshu session — skipping platform.")
-    elif isinstance(xhs_result, BaseException):
-        logger.error("Xiaohongshu scrape failed: %s", xhs_result,
-                     exc_info=(type(xhs_result), xhs_result, xhs_result.__traceback__))
-    else:
-        xhs_candidates = xhs_result
-        logger.info("Xiaohongshu returned %d candidates.", len(xhs_candidates))
-
     persist_keyword = keyword if mode == RunMode.keyword else None
 
-    ig_count = _persist_platform_results(run_id, Platform.instagram, ig_candidates, staging_dir, keyword=persist_keyword)
-    _finish_platform_run(ig_run_id, ig_count, skipped=not ig_candidates)
+    # Each task scrapes its platform and immediately persists + marks itself done so the
+    # frontend can show results as soon as one platform finishes, without waiting for the other.
 
-    xhs_count = _persist_platform_results(run_id, Platform.xiaohongshu, xhs_candidates, staging_dir, keyword=persist_keyword)
-    _finish_platform_run(xhs_run_id, xhs_count, skipped=not xhs_candidates)
+    async def _run_ig() -> int:
+        try:
+            if mode == RunMode.keyword:
+                logger.info("Starting Instagram scrape (keyword=%r)", keyword)
+                candidates = await _scrape_instagram(
+                    keyword=keyword,
+                    creator_handles=[],
+                    max_results=_PER_PLATFORM,
+                    skip_urls=seen_urls,
+                )
+            else:
+                logger.info("Starting Instagram discovery scrape")
+                candidates = await _discover_instagram(seen_urls)
+        except SessionExpiredError:
+            logger.warning("Instagram session expired — marking for re-auth.")
+            _invalidate_instagram_session()
+            _finish_platform_run(ig_run_id, 0, skipped=True)
+            return 0
+        except FileNotFoundError:
+            logger.warning("No Instagram session — skipping platform.")
+            _finish_platform_run(ig_run_id, 0, skipped=True)
+            return 0
+        except BaseException as exc:
+            logger.error("Instagram scrape failed: %s", exc,
+                         exc_info=(type(exc), exc, exc.__traceback__))
+            _finish_platform_run(ig_run_id, 0, skipped=True)
+            return 0
+
+        logger.info("Instagram returned %d candidates.", len(candidates))
+        count = _persist_platform_results(run_id, Platform.instagram, candidates, staging_dir, keyword=persist_keyword)
+        _finish_platform_run(ig_run_id, count, skipped=not candidates)
+        return count
+
+    async def _run_xhs() -> int:
+        try:
+            if mode == RunMode.keyword:
+                logger.info("Starting Xiaohongshu scrape (keyword=%r)", keyword)
+                candidates = await scrape_xiaohongshu(
+                    keywords=[keyword] if keyword else [],
+                    max_results=_PER_PLATFORM,
+                    skip_urls=seen_urls,
+                )
+            else:
+                logger.info("Starting Xiaohongshu discovery scrape")
+                candidates = await _discover_xhs(seen_urls)
+        except SessionExpiredError:
+            logger.warning("Xiaohongshu session expired — marking for re-auth.")
+            _invalidate_session("xiaohongshu")
+            _finish_platform_run(xhs_run_id, 0, skipped=True)
+            return 0
+        except FileNotFoundError:
+            logger.warning("No Xiaohongshu session — skipping platform.")
+            _finish_platform_run(xhs_run_id, 0, skipped=True)
+            return 0
+        except BaseException as exc:
+            logger.error("Xiaohongshu scrape failed: %s", exc,
+                         exc_info=(type(exc), exc, exc.__traceback__))
+            _finish_platform_run(xhs_run_id, 0, skipped=True)
+            return 0
+
+        logger.info("Xiaohongshu returned %d candidates.", len(candidates))
+        count = _persist_platform_results(run_id, Platform.xiaohongshu, candidates, staging_dir, keyword=persist_keyword)
+        _finish_platform_run(xhs_run_id, count, skipped=not candidates)
+        return count
+
+    ig_count, xhs_count = await asyncio.gather(_run_ig(), _run_xhs())
 
     # Mark overall run done/failed
     _finish_daily_run(run_id, mode, ig_count + xhs_count)
